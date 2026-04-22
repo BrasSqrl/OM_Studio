@@ -1,0 +1,12 @@
+﻿Quant Studio Monitoring is a separate monitoring application for approved existing models.
+
+It is intended to extend the Quant Studio product family without widening the scope of the development application. The monitoring application focuses on ongoing model oversight activities such as schema alignment, drift review, stability analysis, realized performance review, segmentation analysis, and monitoring-oriented reporting.
+
+The application should preserve the same premium fintech interface and reporting quality as the development application while keeping the monitoring workflow, configuration, and governance logic separate.
+
+The recommended operating model is:
+- separate application
+- separate repository
+- separate Codex project context
+- intentionally shared visual and reporting foundation
+- intentionally separate business logic

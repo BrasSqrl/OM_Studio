@@ -1,0 +1,50 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and packaging outputs
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test, lint, and coverage caches
+.pytest_cache/
+.pytest_tmp/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local secrets and environment overrides
+.streamlit/secrets.toml
+.env
+.env.*
+*.local
+
+# Local temp workspaces and logs
+.test_workspace/
+.setup_tmp/
+tmp/
+temp/
+*.tmp
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-studio-monitoring"
+version = "0.1.0"
+description = "Quant Studio Monitoring: ongoing monitoring for approved existing models"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "streamlit>=1.56",
+  "pandas>=2.2",
+  "numpy>=1.26",
+  "plotly>=6.0",
+  "openpyxl>=3.1",
+  "joblib>=1.4",
+  "scikit-learn>=1.4",
+  "statsmodels>=0.14",
+  "xgboost>=3.0",
+  "kaleido>=1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6.0",
+]
+
+[project.scripts]
+quant-monitoring-gui = "quant_studio_monitoring.gui_launcher:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-p no:cacheprovider"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+  ".venv",
+  ".pytest_tmp",
+  ".test_workspace",
+  "__pycache__",
+  "models",
+  "incoming_data",
+  "thresholds",
+  "runs",
+  "pytest-cache-files-*",
+]
