@@ -88,6 +88,11 @@ class ScoringExecutionOutput:
     bundle_artifacts: dict[str, Any]
 
 
+@dataclass(slots=True)
+class ScoringRuntimeOptions:
+    disable_individual_visual_exports: bool = False
+
+
 def execute_monitoring_run(
     *,
     bundle: ModelBundle,
@@ -95,7 +100,9 @@ def execute_monitoring_run(
     workspace: WorkspaceConfig,
     thresholds: list[ThresholdRecord],
     segment_column: str | None = None,
+    scoring_options: ScoringRuntimeOptions | None = None,
 ) -> MonitoringRunResult:
+    scoring_options = scoring_options or ScoringRuntimeOptions()
     started_at = datetime.now(UTC)
     run_id = started_at.strftime("%Y%m%dT%H%M%SZ")
     run_root = workspace.runs_root / f"{run_id}__{bundle.bundle_id}__{dataset.dataset_id}"
@@ -141,6 +148,7 @@ def execute_monitoring_run(
                 scoring_root=run_root / "scoring_bundle",
                 raw_dataframe=raw_dataframe,
                 contract=contract,
+                scoring_options=scoring_options,
             )
             scoring_output_root = scoring_output.output_root
             current_predictions = scoring_output.predictions
@@ -233,6 +241,7 @@ def run_bundle_scoring(
     scoring_root: Path,
     raw_dataframe: pd.DataFrame,
     contract: InputContractResult,
+    scoring_options: ScoringRuntimeOptions,
 ) -> ScoringExecutionOutput:
     if bundle.bundle_paths.generated_runner_path is None:
         raise BundleExecutionError(
@@ -251,6 +260,7 @@ def run_bundle_scoring(
         prepared_config_path = _prepare_scoring_config(
             bundle=bundle,
             scoring_root=scoring_root,
+            scoring_options=scoring_options,
         )
     except Exception as exc:  # pragma: no cover - defensive wrapper
         raise BundleExecutionError(
@@ -762,13 +772,23 @@ def _build_execution_failure_results(
     return results
 
 
-def _prepare_scoring_config(*, bundle: ModelBundle, scoring_root: Path) -> Path:
+def _prepare_scoring_config(
+    *,
+    bundle: ModelBundle,
+    scoring_root: Path,
+    scoring_options: ScoringRuntimeOptions,
+) -> Path:
     config_payload = _read_json(bundle.bundle_paths.run_config_path)
     execution_payload = dict(config_payload.get("execution", {}))
     execution_payload["mode"] = "score_existing_model"
     execution_payload["existing_model_path"] = str(bundle.bundle_paths.model_path.resolve())
     execution_payload["existing_config_path"] = str(bundle.bundle_paths.run_config_path.resolve())
     config_payload["execution"] = execution_payload
+    diagnostics_payload = dict(config_payload.get("diagnostics", {}))
+    if scoring_options.disable_individual_visual_exports:
+        diagnostics_payload["interactive_visualizations"] = False
+        diagnostics_payload["static_image_exports"] = False
+    config_payload["diagnostics"] = diagnostics_payload
 
     config_path = scoring_root / "monitoring_scoring_config.json"
     with config_path.open("w", encoding="utf-8") as handle:

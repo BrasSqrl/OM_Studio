@@ -15,7 +15,7 @@ from quant_studio_monitoring import (
     execute_monitoring_run,
     load_workspace_config,
 )
-from quant_studio_monitoring.monitoring_pipeline import MonitoringRunResult
+from quant_studio_monitoring.monitoring_pipeline import MonitoringRunResult, ScoringRuntimeOptions
 from quant_studio_monitoring.presentation import inject_styles, render_header
 from quant_studio_monitoring.registry import (
     MonitoringMetadata,
@@ -108,10 +108,11 @@ TEST_HELP_GUIDANCE: dict[str, dict[str, str]] = {
 }
 
 
-def _render_sidebar(workspace, bundles, datasets) -> None:
+def _render_sidebar(workspace, bundles, datasets) -> bool:
     latest_run = st.session_state.get("latest_run")
     runnable_bundles = sum(bundle.is_compliant for bundle in bundles)
     session_runs = len(st.session_state["run_history"])
+    st.session_state.setdefault("disable_individual_visual_exports", False)
 
     with st.sidebar:
         st.markdown(
@@ -152,6 +153,31 @@ def _render_sidebar(workspace, bundles, datasets) -> None:
             st.rerun()
 
         st.markdown(
+            """
+            <section class="sidepanel-card">
+              <div class="sidepanel-kicker">Runtime</div>
+              <h3>Artifact Export Controls</h3>
+              <p>Use this to skip per-figure HTML and PNG exports from the scoring bundle while keeping stitched reports and workbooks.</p>
+            </section>
+            """,
+            unsafe_allow_html=True,
+        )
+        disable_individual_visual_exports = st.toggle(
+            "Disable Individual PNG/HTML Figure Files",
+            value=bool(st.session_state["disable_individual_visual_exports"]),
+            help=(
+                "Turns off per-figure HTML and PNG exports from the scoring bundle. "
+                "The stitched report and workbook remain enabled."
+            ),
+        )
+        st.session_state["disable_individual_visual_exports"] = (
+            disable_individual_visual_exports
+        )
+        st.caption(
+            "Recommended for faster reruns when standalone figure files are not needed."
+        )
+
+        st.markdown(
             f"""
             <section class="sidepanel-card">
               <div class="sidepanel-kicker">Session</div>
@@ -184,6 +210,7 @@ def _render_sidebar(workspace, bundles, datasets) -> None:
                     ]
                 )
             )
+    return bool(st.session_state["disable_individual_visual_exports"])
 
 
 def _render_readiness_banner(bundle, dataset, contract_summary) -> None:
@@ -878,7 +905,7 @@ def main() -> None:
     workspace = load_workspace_config()
     bundles = discover_model_bundles(workspace)
     datasets = discover_datasets(workspace)
-    _render_sidebar(workspace, bundles, datasets)
+    disable_individual_visual_exports = _render_sidebar(workspace, bundles, datasets)
 
     if not bundles:
         _render_empty_state(
@@ -926,6 +953,7 @@ def main() -> None:
             dataset=dataset,
             contract_summary=contract_summary,
             selected_segment=selected_segment,
+            disable_individual_visual_exports=disable_individual_visual_exports,
         )
 
     with tabs[4]:
@@ -1461,6 +1489,7 @@ def _render_run_tab(
     dataset,
     contract_summary,
     selected_segment: str | None,
+    disable_individual_visual_exports: bool,
 ) -> None:
     st.markdown(
         """
@@ -1478,6 +1507,11 @@ def _render_run_tab(
 
     thresholds = load_threshold_records(workspace.thresholds_root, bundle)
     st.caption("Runs use the currently saved threshold set for the selected model bundle.")
+    if disable_individual_visual_exports:
+        st.info(
+            "Individual PNG and per-figure HTML exports are disabled from the left pane for faster reruns. "
+            "The stitched monitoring report and workbook remain enabled."
+        )
 
     if not bundle.is_compliant:
         st.error("This bundle is not runnable for raw-data monitoring reruns.")
@@ -1519,6 +1553,9 @@ def _render_run_tab(
                 workspace=workspace,
                 thresholds=thresholds,
                 segment_column=selected_segment,
+                scoring_options=ScoringRuntimeOptions(
+                    disable_individual_visual_exports=disable_individual_visual_exports
+                ),
             )
         st.session_state["latest_run"] = run_result
         st.session_state["run_history"].insert(0, run_result)

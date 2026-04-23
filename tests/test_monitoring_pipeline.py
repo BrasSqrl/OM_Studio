@@ -7,7 +7,11 @@ from uuid import uuid4
 import pandas as pd
 
 from quant_studio_monitoring.config import WorkspaceConfig
-from quant_studio_monitoring.monitoring_pipeline import ScoringExecutionOutput, execute_monitoring_run
+from quant_studio_monitoring.monitoring_pipeline import (
+    ScoringExecutionOutput,
+    ScoringRuntimeOptions,
+    execute_monitoring_run,
+)
 from quant_studio_monitoring.registry import DatasetAsset, discover_model_bundles
 from quant_studio_monitoring.thresholds import load_threshold_records
 
@@ -105,6 +109,9 @@ def test_execute_monitoring_run_with_mocked_scoring_produces_binary_results(
         workspace=workspace,
         thresholds=thresholds,
         segment_column="region",
+        scoring_options=ScoringRuntimeOptions(
+            disable_individual_visual_exports=True
+        ),
     )
 
     assert result.status == "completed"
@@ -148,6 +155,9 @@ def test_execute_monitoring_run_prepares_score_existing_model_inputs_for_optiona
         workspace=workspace,
         thresholds=thresholds,
         segment_column="region",
+        scoring_options=ScoringRuntimeOptions(
+            disable_individual_visual_exports=True
+        ),
     )
 
     assert result.status == "completed"
@@ -160,6 +170,8 @@ def test_execute_monitoring_run_prepares_score_existing_model_inputs_for_optiona
     assert captured_config["execution"]["mode"] == "score_existing_model"
     assert captured_config["execution"]["existing_model_path"]
     assert captured_config["execution"]["existing_config_path"]
+    assert captured_config["diagnostics"]["interactive_visualizations"] is False
+    assert captured_config["diagnostics"]["static_image_exports"] is False
 
     captured_input = pd.read_csv(result.scoring_output_root / "captured_input.csv")
     assert "legacy_text_field" in captured_input.columns
