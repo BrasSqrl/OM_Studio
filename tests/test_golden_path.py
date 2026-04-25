@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 from uuid import uuid4
-import zipfile
 
 from quant_studio_monitoring import (
     create_demo_assets,

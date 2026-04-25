@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import json
+import zipfile
 from dataclasses import asdict
 from datetime import UTC, datetime
 from hashlib import sha256
-import json
 from pathlib import Path
-import zipfile
 
 import pandas as pd
 import plotly.express as px
 
+from .artifact_completeness import write_artifact_completeness_artifacts
+from .config import MonitoringPerformanceConfig
 from .presentation import apply_fintech_figure_theme
 from .registry import build_bundle_fingerprint_frame, build_dataset_fingerprint_frame
+from .test_applicability import build_test_applicability_matrix
 from .thresholds import ThresholdRecord, threshold_records_to_frame
 
 if False:  # pragma: no cover
@@ -22,10 +25,15 @@ if False:  # pragma: no cover
 
 def write_monitoring_artifacts(
     *,
-    result: "MonitoringRunResult",
+    result: MonitoringRunResult,
     thresholds: list[ThresholdRecord],
     raw_dataframe: pd.DataFrame,
+    artifact_profile: str = "full",
+    performance: MonitoringPerformanceConfig | None = None,
 ) -> dict[str, Path | None]:
+    artifact_profile = _normalize_artifact_profile(artifact_profile)
+    performance = performance or MonitoringPerformanceConfig()
+    performance.validate()
     report_path = result.run_root / "monitoring_report.html"
     workbook_path = result.run_root / "monitoring_workbook.xlsx"
     tests_json_path = result.run_root / "monitoring_tests.json"
@@ -36,12 +44,30 @@ def write_monitoring_artifacts(
     metadata_path = result.run_root / "bundle_metadata.json"
     input_contract_path = result.run_root / "input_contract.json"
     failure_diagnostics_path = result.run_root / "failure_diagnostics.json"
+    reviewer_notes_path = result.run_root / "reviewer_notes.json"
+    reviewer_exceptions_path = result.run_root / "reviewer_exceptions.json"
+    run_config_path = result.run_root / "monitoring_run_config.json"
+    dataset_provenance_path = result.run_root / "dataset_provenance.json"
+    artifact_completeness_csv_path = result.run_root / "artifact_completeness.csv"
+    artifact_completeness_json_path = result.run_root / "artifact_completeness.json"
+    diagnostic_export_path = result.run_root / "diagnostic_export.zip"
     reviewer_package_path = result.run_root / "reviewer_package.zip"
 
     result.run_root.mkdir(parents=True, exist_ok=True)
 
     support_tables = {name: table.copy(deep=True) for name, table in result.support_tables.items()}
     detailed_results_frame = _build_detailed_results_frame(result)
+    support_tables["executive_summary"] = _build_executive_summary_frame(
+        result=result,
+        raw_dataframe=raw_dataframe,
+        detailed_results_frame=detailed_results_frame,
+    )
+    support_tables["test_enablement_profile"] = _build_test_enablement_profile_frame(thresholds)
+    support_tables["test_applicability_matrix"] = build_test_applicability_matrix(
+        result=result,
+        thresholds=thresholds,
+    )
+    support_tables["reviewer_exception_summary"] = _build_reviewer_exception_summary_frame(result)
     support_tables["test_result_summary"] = detailed_results_frame
     support_tables["category_status_summary"] = _build_category_status_summary(detailed_results_frame)
     support_tables["failed_test_summary"] = detailed_results_frame.loc[
@@ -60,11 +86,14 @@ def write_monitoring_artifacts(
         thresholds=thresholds,
     )
     support_tables["failure_diagnostics"] = _build_failure_diagnostics_frame(result)
+    support_tables["dataset_provenance"] = pd.DataFrame(
+        [{"field": key, "value": value} for key, value in result.dataset_provenance.items()]
+    )
     result.support_tables = support_tables
 
     results_frame = detailed_results_frame
     results_frame.to_csv(tests_csv_path, index=False)
-    _write_json(tests_json_path, {"tests": [asdict(item) for item in result.test_results]})
+    _write_json(tests_json_path, {"tests": detailed_results_frame.to_dict(orient="records")})
     _write_json(
         thresholds_path,
         {"thresholds": [asdict(record) for record in thresholds]},
@@ -84,6 +113,8 @@ def write_monitoring_artifacts(
             "monitoring_notes": result.model_bundle.monitoring_metadata.monitoring_notes,
             "model_type": result.model_bundle.model_type,
             "target_mode": result.model_bundle.target_mode,
+            "monitoring_contract_version": result.model_bundle.monitoring_contract_version,
+            "monitoring_contract_version_status": result.model_bundle.monitoring_contract_version_status,
             "bundle_path": str(result.model_bundle.bundle_paths.root),
             "monitoring_metadata_path": str(result.model_bundle.bundle_paths.root / "monitoring_metadata.json"),
         },
@@ -102,13 +133,23 @@ def write_monitoring_artifacts(
         },
     )
     _write_json(failure_diagnostics_path, result.failure_context or {})
+    _write_json(reviewer_notes_path, {"reviewer_notes": result.reviewer_notes})
+    _write_json(
+        reviewer_exceptions_path,
+        {"reviewer_exceptions": result.reviewer_exceptions},
+    )
+    _write_json(
+        run_config_path,
+        result.run_config.to_payload() if result.run_config is not None else {},
+    )
+    _write_json(dataset_provenance_path, result.dataset_provenance)
 
     scored_preview = support_tables.get("scored_data_preview")
-    if scored_preview is not None and not scored_preview.empty:
+    if scored_preview is not None and not scored_preview.empty and artifact_profile != "minimal":
         scored_preview.to_csv(scored_csv_path, index=False)
 
     for table_name, table in support_tables.items():
-        if table.empty:
+        if table.empty or not _should_write_support_csv(table_name, artifact_profile):
             continue
         table.to_csv(result.run_root / f"{table_name}.csv", index=False)
 
@@ -119,6 +160,7 @@ def write_monitoring_artifacts(
         raw_dataframe=raw_dataframe,
         support_tables=support_tables,
         detailed_results_frame=detailed_results_frame,
+        artifact_profile=artifact_profile,
     )
     report_path.write_text(
         _build_html_report(
@@ -127,12 +169,15 @@ def write_monitoring_artifacts(
             raw_dataframe=raw_dataframe,
             support_tables=support_tables,
             detailed_results_frame=detailed_results_frame,
+            artifact_profile=artifact_profile,
+            performance=performance,
         ),
         encoding="utf-8",
     )
 
     manifest = {
         "run_root": str(result.run_root),
+        "artifact_profile": artifact_profile,
         "report": str(report_path),
         "workbook": str(workbook_path),
         "tests_json": str(tests_json_path),
@@ -141,7 +186,15 @@ def write_monitoring_artifacts(
         "bundle_metadata": str(metadata_path),
         "input_contract": str(input_contract_path),
         "failure_diagnostics": str(failure_diagnostics_path),
-        "reviewer_package": str(reviewer_package_path),
+        "reviewer_notes": str(reviewer_notes_path),
+        "reviewer_exceptions": str(reviewer_exceptions_path),
+        "monitoring_run_config": str(run_config_path),
+        "dataset_provenance": str(dataset_provenance_path),
+        "artifact_completeness_csv": str(artifact_completeness_csv_path),
+        "artifact_completeness_json": str(artifact_completeness_json_path),
+        "manifest": str(manifest_path),
+        "diagnostic_export": str(diagnostic_export_path),
+        "reviewer_package": str(reviewer_package_path) if artifact_profile != "minimal" else None,
         "scoring_output_root": str(result.scoring_output_root) if result.scoring_output_root else None,
         "bundle_fingerprint": str(result.run_root / "bundle_fingerprint.csv"),
         "dataset_fingerprint": str(result.run_root / "dataset_fingerprint.csv"),
@@ -149,22 +202,100 @@ def write_monitoring_artifacts(
     }
     if scored_csv_path.exists():
         manifest["current_scored_data"] = str(scored_csv_path)
+    manifest["generated_artifacts"] = _generated_artifact_index(
+        manifest=manifest,
+        planned_paths={"reviewer_package"} if artifact_profile != "minimal" else set(),
+    )
+    manifest["skipped_artifacts"] = _skipped_artifact_index(
+        artifact_profile=artifact_profile,
+        scored_csv_path=scored_csv_path,
+    )
     _write_json(manifest_path, manifest)
     _build_reviewer_package(
-        reviewer_package_path=reviewer_package_path,
+        reviewer_package_path=diagnostic_export_path,
         files=[
-            report_path,
-            workbook_path,
+            manifest_path,
             tests_csv_path,
             tests_json_path,
             thresholds_path,
-            manifest_path,
             metadata_path,
             input_contract_path,
             failure_diagnostics_path,
-            scored_csv_path if scored_csv_path.exists() else None,
+            reviewer_notes_path,
+            reviewer_exceptions_path,
+            run_config_path,
+            dataset_provenance_path,
         ],
     )
+    completeness_frame = write_artifact_completeness_artifacts(
+        manifest=manifest,
+        csv_path=artifact_completeness_csv_path,
+        json_path=artifact_completeness_json_path,
+        planned_keys={"reviewer_package"} if artifact_profile != "minimal" else set(),
+    )
+    support_tables["artifact_completeness"] = completeness_frame
+    result.support_tables = support_tables
+    missing_count = int((completeness_frame["status"] == "missing").sum())
+    manifest["artifact_completeness_status"] = "complete" if missing_count == 0 else "incomplete"
+    manifest["generated_artifacts"] = _generated_artifact_index(
+        manifest=manifest,
+        planned_paths={"reviewer_package"} if artifact_profile != "minimal" else set(),
+    )
+    _write_json(manifest_path, manifest)
+    _write_workbook(
+        workbook_path=workbook_path,
+        result=result,
+        thresholds=thresholds,
+        raw_dataframe=raw_dataframe,
+        support_tables=support_tables,
+        detailed_results_frame=detailed_results_frame,
+        artifact_profile=artifact_profile,
+    )
+    report_path.write_text(
+        _build_html_report(
+            result=result,
+            thresholds=thresholds,
+            raw_dataframe=raw_dataframe,
+            support_tables=support_tables,
+            detailed_results_frame=detailed_results_frame,
+            artifact_profile=artifact_profile,
+            performance=performance,
+        ),
+        encoding="utf-8",
+    )
+    if artifact_profile != "minimal":
+        _build_reviewer_package(
+            reviewer_package_path=reviewer_package_path,
+            files=[
+                report_path,
+                workbook_path,
+                tests_csv_path,
+                tests_json_path,
+                thresholds_path,
+                manifest_path,
+                metadata_path,
+                input_contract_path,
+                failure_diagnostics_path,
+                reviewer_notes_path,
+                reviewer_exceptions_path,
+                run_config_path,
+                dataset_provenance_path,
+                result.run_root / "executive_summary.csv",
+                result.run_root / "test_enablement_profile.csv",
+                result.run_root / "test_applicability_matrix.csv",
+                result.run_root / "reviewer_exception_summary.csv",
+                result.run_root / "model_bundle_intake_checklist.csv",
+                result.run_root / "dataset_provenance.csv",
+                result.run_root / "bundle_fingerprint.csv",
+                result.run_root / "dataset_fingerprint.csv",
+                result.run_root / "run_fingerprint.csv",
+                result.run_root / "reference_baseline_diagnostics.csv",
+                result.run_root / "data_quality_summary.csv",
+                result.run_root / "feature_drift_summary.csv",
+                result.run_root / "outcome_join_summary.csv",
+                scored_csv_path if scored_csv_path.exists() else None,
+            ],
+        )
 
     return {
         "report": report_path,
@@ -175,20 +306,128 @@ def write_monitoring_artifacts(
         "bundle_metadata": metadata_path,
         "input_contract": input_contract_path,
         "failure_diagnostics": failure_diagnostics_path,
+        "reviewer_notes": reviewer_notes_path,
+        "reviewer_exceptions": reviewer_exceptions_path,
+        "monitoring_run_config": run_config_path,
+        "dataset_provenance": dataset_provenance_path,
+        "artifact_completeness_csv": artifact_completeness_csv_path,
+        "artifact_completeness_json": artifact_completeness_json_path,
+        "diagnostic_export": diagnostic_export_path,
         "current_scored_data": scored_csv_path if scored_csv_path.exists() else None,
         "manifest": manifest_path,
-        "reviewer_package": reviewer_package_path,
+        "reviewer_package": reviewer_package_path if reviewer_package_path.exists() else None,
+    }
+
+
+def _normalize_artifact_profile(value: str) -> str:
+    normalized = str(value or "full").strip().lower()
+    return normalized if normalized in {"full", "reviewer", "minimal"} else "full"
+
+
+def _generated_artifact_index(
+    *,
+    manifest: dict[str, object],
+    planned_paths: set[str],
+) -> dict[str, str]:
+    generated: dict[str, str] = {}
+    for key, value in manifest.items():
+        if not isinstance(value, str):
+            continue
+        path = Path(value)
+        if path.exists() or key in planned_paths:
+            generated[key] = value
+    return generated
+
+
+def _skipped_artifact_index(
+    *,
+    artifact_profile: str,
+    scored_csv_path: Path,
+) -> list[dict[str, str]]:
+    skipped: list[dict[str, str]] = []
+    if artifact_profile == "minimal":
+        skipped.append(
+            {
+                "artifact": "reviewer_package",
+                "reason": "Minimal artifact profile skips the zip package.",
+            }
+        )
+    if not scored_csv_path.exists():
+        skipped.append(
+            {
+                "artifact": "current_scored_data",
+                "reason": (
+                    "Scored data CSV is only written when a scored preview exists "
+                    "and the artifact profile is not minimal."
+                ),
+            }
+        )
+    return skipped
+
+
+def _should_write_support_csv(table_name: str, artifact_profile: str) -> bool:
+    if artifact_profile == "full":
+        return True
+    if artifact_profile == "minimal":
+        return table_name in {
+            "executive_summary",
+            "test_result_summary",
+            "failure_diagnostics",
+            "dataset_provenance",
+            "bundle_fingerprint",
+            "dataset_fingerprint",
+            "run_fingerprint",
+        }
+    return table_name in {
+        "executive_summary",
+        "test_result_summary",
+        "category_status_summary",
+        "failed_test_summary",
+        "reference_monitoring_delta_summary",
+        "reference_baseline_diagnostics",
+        "data_quality_summary",
+        "feature_drift_summary",
+        "outcome_join_summary",
+        "test_enablement_profile",
+        "test_applicability_matrix",
+        "reviewer_exception_summary",
+        "model_bundle_intake_checklist",
+        "failure_diagnostics",
+        "dataset_provenance",
+        "bundle_fingerprint",
+        "dataset_fingerprint",
+        "run_fingerprint",
+    }
+
+
+def _should_write_workbook_sheet(table_name: str, artifact_profile: str) -> bool:
+    if artifact_profile in {"full", "reviewer"}:
+        return True
+    return table_name in {
+        "test_result_summary",
+        "category_status_summary",
+        "failed_test_summary",
+        "reference_monitoring_delta_summary",
+        "data_quality_summary",
+        "feature_drift_summary",
+        "test_applicability_matrix",
+        "reviewer_exception_summary",
+        "model_bundle_intake_checklist",
+        "artifact_completeness",
+        "failure_diagnostics",
+        "dataset_provenance",
     }
 
 
 def _write_workbook(
     *,
     workbook_path: Path,
-    result: "MonitoringRunResult",
+    result: MonitoringRunResult,
     thresholds: list[ThresholdRecord],
     raw_dataframe: pd.DataFrame,
     support_tables: dict[str, pd.DataFrame],
     detailed_results_frame: pd.DataFrame,
+    artifact_profile: str,
 ) -> None:
     summary_frame = pd.DataFrame(
         [
@@ -211,6 +450,11 @@ def _write_workbook(
     )
 
     with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
+        support_tables.get("executive_summary", pd.DataFrame()).to_excel(
+            writer,
+            sheet_name="executive_summary",
+            index=False,
+        )
         summary_frame.to_excel(writer, sheet_name="summary", index=False)
         detailed_results_frame.to_excel(writer, sheet_name="test_results", index=False)
         threshold_records_to_frame(thresholds).to_excel(writer, sheet_name="thresholds", index=False)
@@ -229,18 +473,24 @@ def _write_workbook(
             ]
         ).to_excel(writer, sheet_name="input_contract", index=False)
         for table_name, table in support_tables.items():
-            if table.empty:
+            if (
+                table.empty
+                or table_name in {"executive_summary"}
+                or not _should_write_workbook_sheet(table_name, artifact_profile)
+            ):
                 continue
             table.to_excel(writer, sheet_name=_sanitize_sheet_name(table_name), index=False)
 
 
 def _build_html_report(
     *,
-    result: "MonitoringRunResult",
+    result: MonitoringRunResult,
     thresholds: list[ThresholdRecord],
     raw_dataframe: pd.DataFrame,
     support_tables: dict[str, pd.DataFrame],
     detailed_results_frame: pd.DataFrame,
+    artifact_profile: str,
+    performance: MonitoringPerformanceConfig,
 ) -> str:
     results_frame = detailed_results_frame.copy(deep=True)
     if not results_frame.empty:
@@ -249,7 +499,7 @@ def _build_html_report(
 
     figures_html: list[str] = []
     score_profile = support_tables.get("score_profile", pd.DataFrame())
-    if not score_profile.empty:
+    if artifact_profile != "minimal" and not score_profile.empty:
         figure = px.bar(
             score_profile,
             x="population",
@@ -266,7 +516,7 @@ def _build_html_report(
         )
 
     missingness = support_tables.get("missingness_summary", pd.DataFrame()).head(12)
-    if not missingness.empty:
+    if artifact_profile != "minimal" and not missingness.empty:
         figure = px.bar(
             missingness.sort_values("current_missingness_pct", ascending=True),
             x="current_missingness_pct",
@@ -282,7 +532,7 @@ def _build_html_report(
         )
 
     score_band_summary = support_tables.get("score_band_summary", pd.DataFrame())
-    if not score_band_summary.empty:
+    if artifact_profile != "minimal" and not score_band_summary.empty:
         figure = px.line(
             score_band_summary,
             x="band_label",
@@ -298,7 +548,7 @@ def _build_html_report(
         )
 
     segment_summary = support_tables.get("segment_summary", pd.DataFrame())
-    if not segment_summary.empty:
+    if artifact_profile != "minimal" and not segment_summary.empty:
         y_values = ["current_share_pct"]
         if "reference_share_pct" in segment_summary.columns:
             y_values.append("reference_share_pct")
@@ -380,12 +630,21 @@ def _build_html_report(
 
     rows.extend(
         [
+            "<h2>Executive Summary</h2>",
+            _table_preview_html(support_tables["executive_summary"], performance),
             "<h2>Reviewer Summary</h2>",
-            support_tables["category_status_summary"].to_html(index=False, border=0),
+            _table_preview_html(support_tables["category_status_summary"], performance),
+            "<h2>Reviewer Exceptions</h2>",
+            _table_preview_html(support_tables["reviewer_exception_summary"], performance),
+            "<h2>Model Bundle Intake Checklist</h2>",
+            _table_preview_html(support_tables["model_bundle_intake_checklist"], performance),
             "<h2>Reference Vs Monitoring Delta</h2>",
-            support_tables["reference_monitoring_delta_summary"].to_html(index=False, border=0),
+            _table_preview_html(
+                support_tables["reference_monitoring_delta_summary"],
+                performance,
+            ),
             "<h2>Per-Test Results</h2>",
-            _results_table_html(results_frame),
+            _results_table_html(results_frame.head(performance.html_table_preview_rows)),
         ]
     )
 
@@ -394,7 +653,7 @@ def _build_html_report(
         rows.extend(
             [
                 "<h2>Failed Tests</h2>",
-                failed_tests.to_html(index=False, border=0),
+                _table_preview_html(failed_tests, performance),
             ]
         )
 
@@ -403,9 +662,10 @@ def _build_html_report(
             "<h2>Threshold Snapshot</h2>",
             threshold_records_to_frame(thresholds)
             .drop(columns=["test_id"])
+            .head(performance.html_table_preview_rows)
             .to_html(index=False, border=0),
             "<h2>Model Metadata</h2>",
-            support_tables["model_metadata"].to_html(index=False, border=0),
+            _table_preview_html(support_tables["model_metadata"], performance),
             "<h2>Input Contract</h2>",
             pd.DataFrame(
                 [
@@ -419,13 +679,13 @@ def _build_html_report(
                         "segment_column": result.segment_column,
                     }
                 ]
-            ).to_html(index=False, border=0),
+            ).head(performance.html_table_preview_rows).to_html(index=False, border=0),
             "<h2>Run Fingerprint</h2>",
-            support_tables["run_fingerprint"].to_html(index=False, border=0),
+            _table_preview_html(support_tables["run_fingerprint"], performance),
             "<h2>Dataset Fingerprint</h2>",
-            support_tables["dataset_fingerprint"].to_html(index=False, border=0),
+            _table_preview_html(support_tables["dataset_fingerprint"], performance),
             "<h2>Bundle Fingerprint</h2>",
-            support_tables["bundle_fingerprint"].to_html(index=False, border=0),
+            _table_preview_html(support_tables["bundle_fingerprint"], performance),
         ]
     )
 
@@ -434,23 +694,50 @@ def _build_html_report(
         rows.extend(
             [
                 "<h2>Failure Diagnostics</h2>",
-                failure_diagnostics.to_html(index=False, border=0),
+                _table_preview_html(failure_diagnostics, performance),
             ]
         )
 
     if figures_html:
         rows.append("<h2>Monitoring Figures</h2>")
-        rows.extend(figures_html)
+        rows.extend(figures_html[: performance.html_max_figures])
+        if len(figures_html) > performance.html_max_figures:
+            rows.append(
+                f"<p class='muted'>Showing first {performance.html_max_figures:,} "
+                f"of {len(figures_html):,} figures in this HTML report.</p>"
+            )
 
-    for table_name in ("missingness_summary", "score_band_summary", "segment_summary"):
+    for table_name in (
+        "reference_baseline_diagnostics",
+        "test_applicability_matrix",
+        "artifact_completeness",
+        "data_quality_summary",
+        "feature_drift_summary",
+        "outcome_join_summary",
+        "test_enablement_profile",
+        "missingness_summary",
+        "score_band_summary",
+        "segment_summary",
+    ):
         table = support_tables.get(table_name, pd.DataFrame())
         if table.empty:
             continue
         rows.append(f"<h2>{_escape(table_name.replace('_', ' ').title())}</h2>")
-        rows.append(table.to_html(index=False, border=0))
+        rows.append(_table_preview_html(table, performance))
 
     rows.extend(["</main>", "</body>", "</html>"])
     return "\n".join(rows)
+
+
+def _table_preview_html(frame: pd.DataFrame, performance: MonitoringPerformanceConfig) -> str:
+    if len(frame) <= performance.html_table_preview_rows:
+        return frame.to_html(index=False, border=0)
+    preview = frame.head(performance.html_table_preview_rows)
+    return (
+        preview.to_html(index=False, border=0)
+        + f"<p class='muted'>Showing first {performance.html_table_preview_rows:,} "
+        f"of {len(frame):,} rows in the HTML report. See the workbook for the full table.</p>"
+    )
 
 
 def _results_table_html(frame: pd.DataFrame) -> str:
@@ -459,7 +746,7 @@ def _results_table_html(frame: pd.DataFrame) -> str:
 
     rows = [
         "<table>",
-        "<thead><tr><th>Test</th><th>Category</th><th>Status</th><th>Observed</th><th>Benchmark</th><th>Interpretation</th><th>Detail</th></tr></thead>",
+        "<thead><tr><th>Test</th><th>Category</th><th>Status</th><th>Observed</th><th>Benchmark</th><th>Interpretation</th><th>Detail</th><th>Reviewer Exception</th><th>Reviewer Note</th></tr></thead>",
         "<tbody>",
     ]
     for item in frame.to_dict(orient="records"):
@@ -472,19 +759,34 @@ def _results_table_html(frame: pd.DataFrame) -> str:
             f"<td>{_escape(str(item['benchmark']))}</td>"
             f"<td>{_escape(str(item['interpretation']))}</td>"
             f"<td>{_escape(str(item['detail']))}</td>"
+            f"<td>{_escape(str(item.get('reviewer_exception', '')))}</td>"
+            f"<td>{_escape(str(item.get('reviewer_note', '')))}</td>"
             "</tr>"
         )
     rows.extend(["</tbody>", "</table>"])
     return "\n".join(rows)
 
 
-def _build_detailed_results_frame(result: "MonitoringRunResult") -> pd.DataFrame:
+def _build_detailed_results_frame(result: MonitoringRunResult) -> pd.DataFrame:
     frame = result.results_frame.copy(deep=True)
     if frame.empty:
         return frame
 
     frame["benchmark"] = frame.apply(_benchmark_text, axis=1)
     frame["interpretation"] = frame.apply(_interpret_result_row, axis=1)
+    frame["reviewer_note"] = frame["test_id"].map(result.reviewer_notes).fillna("")
+    frame["reviewer_exception"] = frame["test_id"].map(
+        lambda test_id: result.reviewer_exceptions.get(str(test_id), {}).get(
+            "disposition",
+            "",
+        )
+    )
+    frame["reviewer_exception_rationale"] = frame["test_id"].map(
+        lambda test_id: result.reviewer_exceptions.get(str(test_id), {}).get(
+            "rationale",
+            "",
+        )
+    )
     ordered_columns = [
         "test_id",
         "label",
@@ -496,8 +798,98 @@ def _build_detailed_results_frame(result: "MonitoringRunResult") -> pd.DataFrame
         "benchmark",
         "interpretation",
         "detail",
+        "reviewer_exception",
+        "reviewer_exception_rationale",
+        "reviewer_note",
     ]
     return frame[ordered_columns]
+
+
+def _build_executive_summary_frame(
+    *,
+    result: MonitoringRunResult,
+    raw_dataframe: pd.DataFrame,
+    detailed_results_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    failed_tests = []
+    if not detailed_results_frame.empty:
+        failed_tests = detailed_results_frame.loc[
+            detailed_results_frame["status"] == "fail",
+            "label",
+        ].astype(str).tolist()
+    return pd.DataFrame(
+        [
+            {
+                "run_id": result.run_id,
+                "started_at_utc": result.started_at.isoformat(),
+                "model_name": result.model_bundle.display_name,
+                "model_version": result.model_bundle.model_version,
+                "dataset_name": result.dataset.name,
+                "run_status": result.status,
+                "monitoring_mode": "full_monitoring" if result.labels_available else "score_only",
+                "score_column": result.score_column or "n/a",
+                "row_count": len(raw_dataframe),
+                "test_count": len(detailed_results_frame),
+                "pass_count": result.pass_count,
+                "fail_count": result.fail_count,
+                "na_count": result.na_count,
+                "failed_tests": ", ".join(failed_tests) if failed_tests else "none",
+                "reviewer_exception_count": len(result.reviewer_exceptions),
+            }
+        ]
+    )
+
+
+def _build_reviewer_exception_summary_frame(result: MonitoringRunResult) -> pd.DataFrame:
+    rows = []
+    result_lookup = (
+        result.results_frame.set_index("test_id").to_dict(orient="index")
+        if not result.results_frame.empty
+        else {}
+    )
+    for test_id, payload in result.reviewer_exceptions.items():
+        test_result = result_lookup.get(test_id, {})
+        rows.append(
+            {
+                "test_id": test_id,
+                "label": test_result.get("label", test_id),
+                "status": test_result.get("status", "n/a"),
+                "disposition": payload.get("disposition", ""),
+                "rationale": payload.get("rationale", ""),
+                "reviewer_note": result.reviewer_notes.get(test_id, ""),
+            }
+        )
+    if rows:
+        return pd.DataFrame(rows)
+    return pd.DataFrame(
+        [
+            {
+                "test_id": "none",
+                "label": "No reviewer exceptions recorded",
+                "status": "n/a",
+                "disposition": "none",
+                "rationale": "",
+                "reviewer_note": "",
+            }
+        ]
+    )
+
+
+def _build_test_enablement_profile_frame(thresholds: list[ThresholdRecord]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "test_id": threshold.test_id,
+                "label": threshold.label,
+                "category": threshold.category,
+                "enabled": threshold.enabled,
+                "operator": threshold.operator,
+                "threshold_value": threshold.value,
+                "description": threshold.description,
+            }
+            for threshold in thresholds
+        ]
+    )
 
 
 def _build_category_status_summary(results_frame: pd.DataFrame) -> pd.DataFrame:
@@ -517,7 +909,7 @@ def _build_category_status_summary(results_frame: pd.DataFrame) -> pd.DataFrame:
 
 def _build_reference_monitoring_delta_summary(
     *,
-    result: "MonitoringRunResult",
+    result: MonitoringRunResult,
     raw_dataframe: pd.DataFrame,
     support_tables: dict[str, pd.DataFrame],
     detailed_results_frame: pd.DataFrame,
@@ -624,7 +1016,7 @@ def _delta_row(
 
 def _build_run_fingerprint_frame(
     *,
-    result: "MonitoringRunResult",
+    result: MonitoringRunResult,
     thresholds: list[ThresholdRecord],
 ) -> pd.DataFrame:
     threshold_payload = [asdict(record) for record in thresholds]
@@ -667,7 +1059,7 @@ def _build_run_fingerprint_frame(
     )
 
 
-def _build_failure_diagnostics_frame(result: "MonitoringRunResult") -> pd.DataFrame:
+def _build_failure_diagnostics_frame(result: MonitoringRunResult) -> pd.DataFrame:
     if not result.failure_context and not result.error_message:
         return pd.DataFrame(columns=["field", "value"])
     rows = [

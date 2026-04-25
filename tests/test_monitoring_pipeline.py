@@ -13,6 +13,7 @@ from quant_studio_monitoring.monitoring_pipeline import (
     execute_monitoring_run,
 )
 from quant_studio_monitoring.registry import DatasetAsset, discover_model_bundles
+from quant_studio_monitoring.run_history import load_run_index
 from quant_studio_monitoring.thresholds import load_threshold_records
 
 
@@ -49,6 +50,18 @@ def test_execute_monitoring_run_contract_failure_writes_artifacts() -> None:
     assert result.artifacts["manifest"] is not None
     assert result.failure_stage == "input_contract"
     assert result.artifacts["failure_diagnostics"] is not None
+    assert result.artifacts["run_events"] is not None
+    assert result.artifacts["monitoring_run_config"] is not None
+    assert result.artifacts["dataset_provenance"] is not None
+    assert result.artifacts["step_manifest"] is not None
+    assert result.artifacts["run_debug_trace"] is not None
+    assert result.artifacts["artifact_completeness_csv"] is not None
+    assert result.artifacts["artifact_completeness_json"] is not None
+    assert result.artifacts["diagnostic_export"] is not None
+    assert Path(result.artifacts["run_events"]).exists()
+    assert Path(result.artifacts["step_manifest"]).exists()
+    assert Path(result.artifacts["run_debug_trace"]).exists()
+    assert Path(result.artifacts["diagnostic_export"]).exists()
 
 
 def test_execute_monitoring_run_with_mocked_scoring_produces_binary_results(
@@ -121,7 +134,25 @@ def test_execute_monitoring_run_with_mocked_scoring_produces_binary_results(
     assert results.loc["score_psi", "observed_value"] is not None
     assert result.artifacts["report"] is not None
     assert result.artifacts["reviewer_package"] is not None
+    assert result.artifacts["run_events"] is not None
+    assert result.artifacts["monitoring_run_config"] is not None
+    assert result.artifacts["dataset_provenance"] is not None
+    assert result.artifacts["step_manifest"] is not None
+    assert result.artifacts["run_debug_trace"] is not None
+    assert result.artifacts["artifact_completeness_csv"] is not None
+    assert result.artifacts["diagnostic_export"] is not None
     assert "reference_monitoring_delta_summary" in result.support_tables
+    assert "data_quality_summary" in result.support_tables
+    assert "feature_drift_summary" in result.support_tables
+    assert "reference_baseline_diagnostics" in result.support_tables
+    assert "test_applicability_matrix" in result.support_tables
+    assert "artifact_completeness" in result.support_tables
+    assert "max_feature_psi" in set(results.index)
+    assert "duplicate_identifier_count" in set(results.index)
+
+    persisted = load_run_index(workspace)
+    assert persisted.loc[0, "run_id"] == result.run_id
+    assert persisted.loc[0, "status"] == "completed"
 
 
 def test_execute_monitoring_run_prepares_score_existing_model_inputs_for_optional_columns() -> None:
@@ -183,11 +214,146 @@ def test_execute_monitoring_run_prepares_score_existing_model_inputs_for_optiona
     assert results.loc["auc", "status"] == "na"
     assert result.artifacts["report"] is not None
     assert result.artifacts["reviewer_package"] is not None
+    assert result.artifacts["monitoring_run_config"] is not None
     report_html = Path(result.artifacts["report"]).read_text(encoding="utf-8")
     assert "Score-Only Run" in report_html
     assert "Bundle Fingerprint" in report_html
     assert "Dataset Fingerprint" in report_html
     assert "Reference Vs Monitoring Delta" in report_html
+    assert "Executive Summary" in report_html
+
+
+def test_execute_monitoring_run_joins_separate_outcome_file_and_exports_notes(
+    monkeypatch,
+) -> None:
+    workspace = _build_workspace()
+    bundle_root = workspace.models_root / "retail_pd_v1"
+    bundle_root.mkdir(parents=True)
+    _write_bundle(bundle_root)
+
+    dataset_path = workspace.incoming_data_root / "monitoring.csv"
+    pd.DataFrame(
+        {
+            "as_of_date": ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"],
+            "loan_id": ["L1", "L2", "L3", "L4"],
+            "balance": [100.0, 120.0, 90.0, 140.0],
+            "region": ["north", "south", "north", "east"],
+        }
+    ).to_csv(dataset_path, index=False)
+    outcome_path = workspace.incoming_data_root / "outcomes.csv"
+    pd.DataFrame(
+        {
+            "loan_id": ["L1", "L2", "L3", "L4"],
+            "default_status": [0, 1, 0, 1],
+        }
+    ).to_csv(outcome_path, index=False)
+
+    bundle = discover_model_bundles(workspace)[0]
+    dataset = DatasetAsset(
+        dataset_id="monitoring_csv",
+        name=dataset_path.name,
+        path=dataset_path,
+        suffix=".csv",
+        modified_at=pd.Timestamp.now("UTC").to_pydatetime(),
+    )
+
+    def _mock_scoring(**kwargs):
+        raw_dataframe = kwargs["raw_dataframe"]
+        assert raw_dataframe["default_status"].tolist() == [0, 1, 0, 1]
+        output_root = kwargs["scoring_root"] / "mock_run"
+        output_root.mkdir(parents=True)
+        predictions = pd.DataFrame(
+            {
+                "loan_id": raw_dataframe["loan_id"],
+                "default_flag": raw_dataframe["default_status"],
+                "predicted_probability_recommended": [0.1, 0.8, 0.2, 0.7],
+            }
+        )
+        predictions.to_csv(output_root / "predictions.csv", index=False)
+        return ScoringExecutionOutput(
+            output_root=output_root,
+            predictions=predictions,
+            metrics={},
+            bundle_artifacts={},
+        )
+
+    monkeypatch.setattr(
+        "quant_studio_monitoring.monitoring_pipeline.run_bundle_scoring",
+        _mock_scoring,
+    )
+
+    thresholds = load_threshold_records(workspace.thresholds_root, bundle)
+    result = execute_monitoring_run(
+        bundle=bundle,
+        dataset=dataset,
+        workspace=workspace,
+        thresholds=thresholds,
+        scoring_options=ScoringRuntimeOptions(
+            outcome_dataset_path=outcome_path,
+            outcome_join_columns=["loan_id"],
+        ),
+        reviewer_notes={"score_psi": "Reviewed drift exception."},
+        reviewer_exceptions={
+            "score_psi": {
+                "disposition": "Exception Noted",
+                "rationale": "Temporary portfolio mix shift.",
+            }
+        },
+    )
+
+    assert result.status == "completed"
+    assert result.labels_available is True
+    assert "outcome_join_summary" in result.support_tables
+    assert result.support_tables["outcome_join_summary"].loc[0, "matched_rows"] == 4
+    assert result.artifacts["reviewer_notes"] is not None
+    assert result.artifacts["reviewer_exceptions"] is not None
+    assert result.artifacts["run_events"] is not None
+    assert result.artifacts["monitoring_run_config"] is not None
+    notes_payload = json.loads(Path(result.artifacts["reviewer_notes"]).read_text(encoding="utf-8"))
+    assert notes_payload["reviewer_notes"]["score_psi"] == "Reviewed drift exception."
+    exceptions_payload = json.loads(
+        Path(result.artifacts["reviewer_exceptions"]).read_text(encoding="utf-8")
+    )
+    assert exceptions_payload["reviewer_exceptions"]["score_psi"]["disposition"] == "Exception Noted"
+    assert "reviewer_exception_summary" in result.support_tables
+
+
+def test_execute_monitoring_run_minimal_artifact_profile_skips_reviewer_package() -> None:
+    workspace = _build_workspace()
+    bundle_root = workspace.models_root / "retail_pd_v1"
+    bundle_root.mkdir(parents=True)
+    _write_bundle(bundle_root)
+
+    dataset_path = workspace.incoming_data_root / "monitoring.csv"
+    pd.DataFrame({"loan_id": ["L1"], "default_status": [1]}).to_csv(dataset_path, index=False)
+
+    bundle = discover_model_bundles(workspace)[0]
+    dataset = DatasetAsset(
+        dataset_id="monitoring_csv",
+        name=dataset_path.name,
+        path=dataset_path,
+        suffix=".csv",
+        modified_at=pd.Timestamp.now("UTC").to_pydatetime(),
+    )
+    thresholds = load_threshold_records(workspace.thresholds_root, bundle)
+    result = execute_monitoring_run(
+        bundle=bundle,
+        dataset=dataset,
+        workspace=workspace,
+        thresholds=thresholds,
+        scoring_options=ScoringRuntimeOptions(artifact_profile="minimal"),
+    )
+
+    assert result.artifacts["report"] is not None
+    assert result.artifacts["workbook"] is not None
+    assert result.artifacts["reviewer_package"] is None
+    assert result.artifacts["diagnostic_export"] is not None
+    manifest = json.loads(Path(result.artifacts["manifest"]).read_text(encoding="utf-8"))
+    assert manifest["artifact_profile"] == "minimal"
+    assert "generated_artifacts" in manifest
+    assert any(item["artifact"] == "reviewer_package" for item in manifest["skipped_artifacts"])
+    assert manifest["artifact_completeness_status"] == "complete"
+    assert Path(result.artifacts["run_events"]).exists()
 
 
 def _build_workspace() -> WorkspaceConfig:

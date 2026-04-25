@@ -2,23 +2,58 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
 import json
-from pathlib import Path
 import re
 import subprocess
 import sys
+import zipfile
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
-from scipy.stats import chi2, ks_2samp
-from sklearn.metrics import brier_score_loss, mean_absolute_error, precision_score, recall_score, roc_auc_score
+from scipy.stats import ks_2samp
+from sklearn.metrics import (
+    brier_score_loss,
+    mean_absolute_error,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
-from .config import WorkspaceConfig
+from .artifact_completeness import write_artifact_completeness_artifacts
+from .config import MonitoringPerformanceConfig, WorkspaceConfig
+from .file_cache import read_csv_cached
+from .monitoring_metrics import (
+    bad_rate_by_band_mae,
+    binary_ks,
+    build_data_quality_summary,
+    build_feature_drift_summary,
+    build_label_evaluation_frame,
+    categorical_psi,
+    hosmer_lemeshow_p_value,
+    numeric_series,
+    score_psi,
+    summary_metric_value,
+)
 from .monitoring_reporting import write_monitoring_artifacts
-from .registry import DatasetAsset, InputContractResult, ModelBundle, read_dataset, resolve_prediction_column_name, validate_input_contract
+from .monitoring_run_config import (
+    MonitoringRunConfig,
+    build_dataset_provenance,
+    build_monitoring_run_config,
+)
+from .registry import (
+    DatasetAsset,
+    InputContractResult,
+    ModelBundle,
+    read_dataset,
+    resolve_prediction_column_name,
+    validate_input_contract,
+)
+from .run_history import record_run_index
+from .support_tables import build_support_tables
+from .telemetry import RunTelemetry
 from .thresholds import ThresholdRecord, records_by_test_id
 
 
@@ -62,6 +97,10 @@ class MonitoringRunResult:
     scoring_output_root: Path | None = None
     failure_stage: str | None = None
     failure_context: dict[str, Any] = field(default_factory=dict)
+    reviewer_notes: dict[str, str] = field(default_factory=dict)
+    reviewer_exceptions: dict[str, dict[str, str]] = field(default_factory=dict)
+    run_config: MonitoringRunConfig | None = None
+    dataset_provenance: dict[str, Any] = field(default_factory=dict)
 
     @property
     def results_frame(self) -> pd.DataFrame:
@@ -91,6 +130,10 @@ class ScoringExecutionOutput:
 @dataclass(slots=True)
 class ScoringRuntimeOptions:
     disable_individual_visual_exports: bool = False
+    outcome_dataset_path: Path | None = None
+    outcome_join_columns: list[str] = field(default_factory=list)
+    artifact_profile: str = "full"
+    performance: MonitoringPerformanceConfig = field(default_factory=MonitoringPerformanceConfig)
 
 
 def execute_monitoring_run(
@@ -101,15 +144,49 @@ def execute_monitoring_run(
     thresholds: list[ThresholdRecord],
     segment_column: str | None = None,
     scoring_options: ScoringRuntimeOptions | None = None,
+    reviewer_notes: dict[str, str] | None = None,
+    reviewer_exceptions: dict[str, dict[str, str]] | None = None,
 ) -> MonitoringRunResult:
     scoring_options = scoring_options or ScoringRuntimeOptions()
+    reviewer_notes = reviewer_notes or {}
+    reviewer_exceptions = reviewer_exceptions or {}
     started_at = datetime.now(UTC)
     run_id = started_at.strftime("%Y%m%dT%H%M%SZ")
     run_root = workspace.runs_root / f"{run_id}__{bundle.bundle_id}__{dataset.dataset_id}"
     run_root.mkdir(parents=True, exist_ok=True)
+    telemetry = RunTelemetry()
 
-    raw_dataframe = read_dataset(dataset.path)
-    contract = validate_input_contract(bundle, raw_dataframe, segment_column=segment_column)
+    with telemetry.stage("load_dataset", detail=str(dataset.path)):
+        raw_dataframe = read_dataset(dataset.path)
+    with telemetry.stage("outcome_join", detail=str(scoring_options.outcome_dataset_path or "")):
+        raw_dataframe, outcome_join_summary = _join_outcome_data(
+            raw_dataframe=raw_dataframe,
+            bundle=bundle,
+            outcome_dataset_path=scoring_options.outcome_dataset_path,
+            requested_join_columns=scoring_options.outcome_join_columns,
+        )
+    with telemetry.stage("validate_contract"):
+        contract = validate_input_contract(bundle, raw_dataframe, segment_column=segment_column)
+
+    run_config = build_monitoring_run_config(
+        run_id=run_id,
+        started_at=started_at,
+        bundle=bundle,
+        dataset=dataset,
+        raw_dataframe=raw_dataframe,
+        thresholds=thresholds,
+        artifact_profile=scoring_options.artifact_profile,
+        disable_individual_visual_exports=scoring_options.disable_individual_visual_exports,
+        outcome_dataset_path=scoring_options.outcome_dataset_path,
+        outcome_join_columns=scoring_options.outcome_join_columns,
+        segment_column=segment_column,
+        performance=scoring_options.performance,
+    )
+    dataset_provenance = build_dataset_provenance(
+        dataset=dataset,
+        raw_dataframe=raw_dataframe,
+        run_config=run_config,
+    )
 
     threshold_map = records_by_test_id(thresholds)
     test_results: list[MonitoringTestResult]
@@ -131,25 +208,31 @@ def execute_monitoring_run(
             "missing_required_columns": ", ".join(contract.missing_required_columns),
         }
         test_results = _build_contract_failure_results(threshold_map, contract)
-        support_tables = _build_support_tables(
-            raw_dataframe=raw_dataframe,
-            current_predictions=None,
-            reference_raw=_load_reference_raw(bundle),
-            reference_predictions=_load_reference_predictions(bundle),
-            bundle=bundle,
-            score_column=None,
-            actual_column=contract.resolved_label_column,
-            segment_column=segment_column if contract.segment_available else None,
-        )
+        with telemetry.stage("load_reference"):
+            reference_raw = _load_reference_raw(bundle)
+            reference_predictions = _load_reference_predictions(bundle)
+        with telemetry.stage("build_support_tables"):
+            support_tables = build_support_tables(
+                raw_dataframe=raw_dataframe,
+                current_predictions=None,
+                reference_raw=reference_raw,
+                reference_predictions=reference_predictions,
+                bundle=bundle,
+                score_column=None,
+                actual_column=contract.resolved_label_column,
+                segment_column=segment_column if contract.segment_available else None,
+                run_started_at=started_at,
+            )
     else:
         try:
-            scoring_output = run_bundle_scoring(
-                bundle=bundle,
-                scoring_root=run_root / "scoring_bundle",
-                raw_dataframe=raw_dataframe,
-                contract=contract,
-                scoring_options=scoring_options,
-            )
+            with telemetry.stage("score_bundle"):
+                scoring_output = run_bundle_scoring(
+                    bundle=bundle,
+                    scoring_root=run_root / "scoring_bundle",
+                    raw_dataframe=raw_dataframe,
+                    contract=contract,
+                    scoring_options=scoring_options,
+                )
             scoring_output_root = scoring_output.output_root
             current_predictions = scoring_output.predictions
             score_column = resolve_prediction_column_name(
@@ -159,37 +242,42 @@ def execute_monitoring_run(
             if score_column is None:
                 raise ValueError("Scoring output does not expose a supported prediction column.")
 
-            reference_raw = _load_reference_raw(bundle)
-            reference_predictions = _load_reference_predictions(bundle)
+            with telemetry.stage("load_reference"):
+                reference_raw = _load_reference_raw(bundle)
+                reference_predictions = _load_reference_predictions(bundle)
             actual_column = _resolve_actual_column(current_predictions, bundle)
             applied_segment_column = segment_column if contract.segment_available else None
-            support_tables = _build_support_tables(
-                raw_dataframe=raw_dataframe,
-                current_predictions=current_predictions,
-                reference_raw=reference_raw,
-                reference_predictions=reference_predictions,
-                bundle=bundle,
-                score_column=score_column,
-                actual_column=actual_column,
-                segment_column=applied_segment_column,
-            )
+            with telemetry.stage("build_support_tables"):
+                support_tables = build_support_tables(
+                    raw_dataframe=raw_dataframe,
+                    current_predictions=current_predictions,
+                    reference_raw=reference_raw,
+                    reference_predictions=reference_predictions,
+                    bundle=bundle,
+                    score_column=score_column,
+                    actual_column=actual_column,
+                    segment_column=applied_segment_column,
+                    run_started_at=started_at,
+                )
             labels_available = _labels_available_for_metrics(
                 current_predictions=current_predictions,
                 score_column=score_column,
                 actual_column=actual_column,
             )
-            test_results = _evaluate_tests(
-                threshold_map=threshold_map,
-                bundle=bundle,
-                contract=contract,
-                raw_dataframe=raw_dataframe,
-                current_predictions=current_predictions,
-                reference_raw=reference_raw,
-                reference_predictions=reference_predictions,
-                score_column=score_column,
-                actual_column=actual_column,
-                segment_column=applied_segment_column,
-            )
+            with telemetry.stage("evaluate_tests"):
+                test_results = _evaluate_tests(
+                    threshold_map=threshold_map,
+                    bundle=bundle,
+                    contract=contract,
+                    raw_dataframe=raw_dataframe,
+                    current_predictions=current_predictions,
+                    reference_raw=reference_raw,
+                    reference_predictions=reference_predictions,
+                    score_column=score_column,
+                    actual_column=actual_column,
+                    segment_column=applied_segment_column,
+                    run_started_at=started_at,
+                )
         except Exception as exc:
             status = "execution_failed"
             error_message, failure_stage, failure_context = _extract_failure_details(exc)
@@ -198,16 +286,24 @@ def execute_monitoring_run(
                 contract=contract,
                 error_message=error_message,
             )
-            support_tables = _build_support_tables(
-                raw_dataframe=raw_dataframe,
-                current_predictions=None,
-                reference_raw=_load_reference_raw(bundle),
-                reference_predictions=_load_reference_predictions(bundle),
-                bundle=bundle,
-                score_column=score_column,
-                actual_column=contract.resolved_label_column,
-                segment_column=segment_column if contract.segment_available else None,
-            )
+            with telemetry.stage("load_reference"):
+                reference_raw = _load_reference_raw(bundle)
+                reference_predictions = _load_reference_predictions(bundle)
+            with telemetry.stage("build_support_tables"):
+                support_tables = build_support_tables(
+                    raw_dataframe=raw_dataframe,
+                    current_predictions=None,
+                    reference_raw=reference_raw,
+                    reference_predictions=reference_predictions,
+                    bundle=bundle,
+                    score_column=score_column,
+                    actual_column=contract.resolved_label_column,
+                    segment_column=segment_column if contract.segment_available else None,
+                    run_started_at=started_at,
+                )
+
+    if not outcome_join_summary.empty:
+        support_tables["outcome_join_summary"] = outcome_join_summary
 
     result = MonitoringRunResult(
         run_id=run_id,
@@ -226,13 +322,182 @@ def execute_monitoring_run(
         scoring_output_root=scoring_output_root,
         failure_stage=failure_stage,
         failure_context=failure_context,
+        reviewer_notes=reviewer_notes,
+        reviewer_exceptions=reviewer_exceptions,
+        run_config=run_config,
+        dataset_provenance=dataset_provenance,
     )
-    result.artifacts = write_monitoring_artifacts(
-        result=result,
-        thresholds=thresholds,
-        raw_dataframe=raw_dataframe,
-    )
+    with telemetry.stage("write_artifacts", detail=scoring_options.artifact_profile):
+        result.artifacts = write_monitoring_artifacts(
+            result=result,
+            thresholds=thresholds,
+            raw_dataframe=raw_dataframe,
+            artifact_profile=scoring_options.artifact_profile,
+            performance=scoring_options.performance,
+        )
+    with telemetry.stage("record_run_index"):
+        record_run_index(workspace, result)
+    _persist_telemetry_artifact(result, telemetry)
     return result
+
+
+def _persist_telemetry_artifact(
+    result: MonitoringRunResult,
+    telemetry: RunTelemetry,
+) -> None:
+    telemetry_path = telemetry.write_jsonl(result.run_root / "run_events.jsonl")
+    step_manifest_path = result.run_root / "monitoring_step_manifest.json"
+    run_debug_trace_path = result.run_root / "run_debug_trace.json"
+    _write_json(step_manifest_path, _build_step_manifest_payload(result, telemetry))
+    _write_json(run_debug_trace_path, _build_run_debug_trace_payload(result, telemetry))
+    result.artifacts["run_events"] = telemetry_path
+    result.artifacts["step_manifest"] = step_manifest_path
+    result.artifacts["run_debug_trace"] = run_debug_trace_path
+    diagnostic_export_path = result.run_root / "diagnostic_export.zip"
+    _build_diagnostic_export_package(
+        result=result,
+        package_path=diagnostic_export_path,
+        extra_paths=[telemetry_path, step_manifest_path, run_debug_trace_path],
+    )
+    result.artifacts["diagnostic_export"] = diagnostic_export_path
+    manifest_path = result.artifacts.get("manifest")
+    if manifest_path is not None and Path(manifest_path).exists():
+        payload = _read_json(Path(manifest_path))
+        payload["run_events"] = str(telemetry_path)
+        payload["step_manifest"] = str(step_manifest_path)
+        payload["run_debug_trace"] = str(run_debug_trace_path)
+        payload["diagnostic_export"] = str(diagnostic_export_path)
+        completeness_csv_path = result.run_root / "artifact_completeness.csv"
+        completeness_json_path = result.run_root / "artifact_completeness.json"
+        payload["artifact_completeness_csv"] = str(completeness_csv_path)
+        payload["artifact_completeness_json"] = str(completeness_json_path)
+        completeness_frame = write_artifact_completeness_artifacts(
+            manifest=payload,
+            csv_path=completeness_csv_path,
+            json_path=completeness_json_path,
+        )
+        result.support_tables["artifact_completeness"] = completeness_frame
+        result.artifacts["artifact_completeness_csv"] = completeness_csv_path
+        result.artifacts["artifact_completeness_json"] = completeness_json_path
+        _build_diagnostic_export_package(
+            result=result,
+            package_path=diagnostic_export_path,
+            extra_paths=[telemetry_path, step_manifest_path, run_debug_trace_path],
+        )
+        missing_count = int((completeness_frame["status"] == "missing").sum())
+        payload["artifact_completeness_status"] = "complete" if missing_count == 0 else "incomplete"
+        generated_artifacts = dict(payload.get("generated_artifacts", {}))
+        for key in (
+            "run_events",
+            "step_manifest",
+            "run_debug_trace",
+            "diagnostic_export",
+            "artifact_completeness_csv",
+            "artifact_completeness_json",
+        ):
+            value = payload.get(key)
+            if isinstance(value, str) and Path(value).exists():
+                generated_artifacts[key] = value
+        payload["generated_artifacts"] = generated_artifacts
+        with Path(manifest_path).open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, default=str)
+    package_path = result.artifacts.get("reviewer_package")
+    if package_path is not None and Path(package_path).exists():
+        with zipfile.ZipFile(package_path, "a", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in (
+                telemetry_path,
+                step_manifest_path,
+                run_debug_trace_path,
+                result.artifacts.get("artifact_completeness_csv"),
+                result.artifacts.get("artifact_completeness_json"),
+                diagnostic_export_path,
+            ):
+                if path is None or not Path(path).exists():
+                    continue
+                archive.write(path, arcname=path.name)
+
+
+def _build_step_manifest_payload(
+    result: MonitoringRunResult,
+    telemetry: RunTelemetry,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "run_id": result.run_id,
+        "status": result.status,
+        "steps": [
+            {
+                "order": index,
+                "name": event.stage,
+                "status": event.status,
+                "duration_seconds": event.duration_seconds,
+                "started_at_utc": event.started_at_utc,
+                "detail": event.detail,
+            }
+            for index, event in enumerate(telemetry.events, start=1)
+        ],
+    }
+
+
+def _build_diagnostic_export_package(
+    *,
+    result: MonitoringRunResult,
+    package_path: Path,
+    extra_paths: list[Path],
+) -> None:
+    keys = [
+        "manifest",
+        "tests_json",
+        "tests_csv",
+        "threshold_snapshot",
+        "bundle_metadata",
+        "input_contract",
+        "failure_diagnostics",
+        "reviewer_notes",
+        "reviewer_exceptions",
+        "monitoring_run_config",
+        "dataset_provenance",
+        "artifact_completeness_csv",
+        "artifact_completeness_json",
+    ]
+    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for key in keys:
+            path = result.artifacts.get(key)
+            if path is None or not Path(path).exists():
+                continue
+            archive.write(Path(path), arcname=Path(path).name)
+        for path in extra_paths:
+            if path.exists():
+                archive.write(path, arcname=path.name)
+
+
+def _build_run_debug_trace_payload(
+    result: MonitoringRunResult,
+    telemetry: RunTelemetry,
+) -> dict[str, Any]:
+    total_seconds = round(sum(event.duration_seconds for event in telemetry.events), 6)
+    return {
+        "schema_version": "1.0",
+        "run_id": result.run_id,
+        "status": result.status,
+        "failure_stage": result.failure_stage,
+        "error_message": result.error_message,
+        "failure_context": result.failure_context,
+        "step_count": len(telemetry.events),
+        "total_step_seconds": total_seconds,
+        "events": [asdict(event) for event in telemetry.events],
+        "summary": {
+            "model_name": result.model_bundle.display_name,
+            "model_version": result.model_bundle.model_version,
+            "dataset_name": result.dataset.name,
+            "score_column": result.score_column,
+            "labels_available": result.labels_available,
+            "segment_column": result.segment_column,
+            "pass_count": result.pass_count,
+            "fail_count": result.fail_count,
+            "na_count": result.na_count,
+        },
+    }
 
 
 def run_bundle_scoring(
@@ -319,6 +584,132 @@ def run_bundle_scoring(
     )
 
 
+def _join_outcome_data(
+    *,
+    raw_dataframe: pd.DataFrame,
+    bundle: ModelBundle,
+    outcome_dataset_path: Path | None,
+    requested_join_columns: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if outcome_dataset_path is None:
+        return raw_dataframe, pd.DataFrame()
+
+    summary_base: dict[str, object] = {
+        "outcome_dataset_path": str(outcome_dataset_path),
+        "input_rows": len(raw_dataframe),
+        "status": "not_applied",
+    }
+    try:
+        outcome_dataframe = read_dataset(outcome_dataset_path)
+    except Exception as exc:
+        return raw_dataframe, pd.DataFrame(
+            [
+                {
+                    **summary_base,
+                    "outcome_rows": None,
+                    "matched_rows": None,
+                    "join_columns": "",
+                    "label_columns": "",
+                    "detail": f"Outcome file could not be read: {exc}",
+                }
+            ]
+        )
+
+    join_columns = _resolve_outcome_join_columns(
+        raw_dataframe=raw_dataframe,
+        outcome_dataframe=outcome_dataframe,
+        bundle=bundle,
+        requested_join_columns=requested_join_columns,
+    )
+    label_columns = _resolve_outcome_label_columns(
+        outcome_dataframe=outcome_dataframe,
+        bundle=bundle,
+    )
+    if not join_columns or not label_columns:
+        return raw_dataframe, pd.DataFrame(
+            [
+                {
+                    **summary_base,
+                    "outcome_rows": len(outcome_dataframe),
+                    "matched_rows": None,
+                    "join_columns": ", ".join(join_columns),
+                    "label_columns": ", ".join(label_columns),
+                    "detail": "Outcome join skipped because no valid join keys or label columns were found.",
+                }
+            ]
+        )
+
+    outcome_subset = outcome_dataframe[join_columns + label_columns].drop_duplicates(
+        subset=join_columns,
+        keep="last",
+    )
+    merged = raw_dataframe.merge(
+        outcome_subset,
+        on=join_columns,
+        how="left",
+        suffixes=("", "__outcome"),
+        indicator=True,
+    )
+    matched_rows = int(merged["_merge"].eq("both").sum())
+    for column in label_columns:
+        outcome_column = f"{column}__outcome"
+        if column == bundle.label_output_column and bundle.label_source_column:
+            if bundle.label_source_column in merged.columns:
+                merged[bundle.label_source_column] = merged[bundle.label_source_column].combine_first(
+                    merged[column]
+                )
+            else:
+                merged[bundle.label_source_column] = merged[column]
+        elif outcome_column in merged.columns:
+            merged[column] = merged[column].combine_first(merged[outcome_column])
+            merged = merged.drop(columns=[outcome_column])
+    merged = merged.drop(columns=["_merge"])
+
+    return merged, pd.DataFrame(
+        [
+            {
+                **summary_base,
+                "status": "applied",
+                "outcome_rows": len(outcome_dataframe),
+                "matched_rows": matched_rows,
+                "join_columns": ", ".join(join_columns),
+                "label_columns": ", ".join(label_columns),
+                "detail": "Outcome labels were joined into the scoring input before validation.",
+            }
+        ]
+    )
+
+
+def _resolve_outcome_join_columns(
+    *,
+    raw_dataframe: pd.DataFrame,
+    outcome_dataframe: pd.DataFrame,
+    bundle: ModelBundle,
+    requested_join_columns: list[str],
+) -> list[str]:
+    common_columns = set(raw_dataframe.columns).intersection(outcome_dataframe.columns)
+    requested = [column for column in requested_join_columns if column in common_columns]
+    if requested:
+        return requested
+
+    identifier_columns = [column for column in bundle.identifier_columns if column in common_columns]
+    if identifier_columns:
+        return identifier_columns
+    return [column for column in bundle.date_columns if column in common_columns]
+
+
+def _resolve_outcome_label_columns(
+    *,
+    outcome_dataframe: pd.DataFrame,
+    bundle: ModelBundle,
+) -> list[str]:
+    columns: list[str] = []
+    for candidate in (bundle.label_source_column, bundle.label_output_column):
+        if candidate and candidate in outcome_dataframe.columns and candidate not in columns:
+            columns.append(candidate)
+    return columns
+
+
 def _extract_scoring_output_root(
     scoring_root: Path,
     stdout: str,
@@ -354,15 +745,27 @@ def _evaluate_tests(
     score_column: str,
     actual_column: str | None,
     segment_column: str | None,
+    run_started_at: datetime,
 ) -> list[MonitoringTestResult]:
     results: list[MonitoringTestResult] = []
-    current_scores = _numeric_series(current_predictions[score_column])
+    current_scores = numeric_series(current_predictions[score_column])
     reference_scores = (
-        _numeric_series(reference_predictions[bundle.reference_score_column])
+        numeric_series(reference_predictions[bundle.reference_score_column])
         if reference_predictions is not None
         and bundle.reference_score_column is not None
         and bundle.reference_score_column in reference_predictions.columns
         else None
+    )
+    data_quality = build_data_quality_summary(
+        raw_dataframe=raw_dataframe,
+        reference_raw=reference_raw,
+        bundle=bundle,
+        run_started_at=run_started_at,
+    )
+    feature_drift = build_feature_drift_summary(
+        reference_raw=reference_raw,
+        raw_dataframe=raw_dataframe,
+        bundle=bundle,
     )
 
     results.append(
@@ -387,6 +790,13 @@ def _evaluate_tests(
             detail="Monitoring rows divided by reference input rows.",
         )
     )
+    results.append(
+        _apply_threshold(
+            threshold_map["row_count_absolute"],
+            observed_value=summary_metric_value(data_quality, "row_count_absolute"),
+            detail="Monitoring dataset row count.",
+        )
+    )
 
     max_missingness_pct = 0.0
     if contract.required_input_columns:
@@ -400,11 +810,26 @@ def _evaluate_tests(
             detail="Highest missingness percentage across required raw input columns.",
         )
     )
+    for test_id, detail in (
+        ("duplicate_identifier_count", "Rows duplicated across identifier columns."),
+        ("identifier_null_rate_pct", "Highest null percentage across identifier columns."),
+        ("invalid_date_count", "Non-empty date values that could not be parsed."),
+        ("stale_as_of_date_days", "Days since the latest monitoring as-of date."),
+        ("unexpected_category_count", "Unexpected categorical feature values versus reference input."),
+        ("numeric_range_violation_count", "Numeric feature values outside reference min/max ranges."),
+    ):
+        results.append(
+            _apply_threshold(
+                threshold_map[test_id],
+                observed_value=summary_metric_value(data_quality, test_id),
+                detail=detail,
+            )
+        )
 
     results.append(
         _apply_threshold(
             threshold_map["score_psi"],
-            observed_value=_score_psi(reference_scores, current_scores),
+            observed_value=score_psi(reference_scores, current_scores),
             detail="Population stability index on the selected score column.",
         )
     )
@@ -427,7 +852,7 @@ def _evaluate_tests(
         and segment_column in raw_dataframe.columns
         and segment_column in reference_raw.columns
     ):
-        segment_psi = _categorical_psi(reference_raw[segment_column], raw_dataframe[segment_column])
+        segment_psi = categorical_psi(reference_raw[segment_column], raw_dataframe[segment_column])
     results.append(
         _apply_threshold(
             threshold_map["segment_psi"],
@@ -436,7 +861,31 @@ def _evaluate_tests(
         )
     )
 
-    label_frame = _build_label_evaluation_frame(
+    max_feature_psi = None
+    min_numeric_ks_p_value = None
+    if not feature_drift.empty:
+        psi_values = pd.to_numeric(feature_drift["psi"], errors="coerce").dropna()
+        ks_values = pd.to_numeric(feature_drift["ks_p_value"], errors="coerce").dropna()
+        if not psi_values.empty:
+            max_feature_psi = float(psi_values.max())
+        if not ks_values.empty:
+            min_numeric_ks_p_value = float(ks_values.min())
+    results.extend(
+        [
+            _apply_threshold(
+                threshold_map["max_feature_psi"],
+                observed_value=max_feature_psi,
+                detail="Highest feature-level PSI across raw input features.",
+            ),
+            _apply_threshold(
+                threshold_map["min_numeric_feature_ks_p_value"],
+                observed_value=min_numeric_ks_p_value,
+                detail="Lowest numeric-feature two-sample KS p-value.",
+            ),
+        ]
+    )
+
+    label_frame = build_label_evaluation_frame(
         current_predictions=current_predictions,
         score_column=score_column,
         actual_column=actual_column,
@@ -485,13 +934,13 @@ def _evaluate_tests(
 
     actual_binary = actual_values.astype(int)
     auc_value = _safe_binary_metric(lambda: float(roc_auc_score(actual_binary, scored_values)))
-    ks_value = _binary_ks(actual_binary, scored_values)
+    ks_value = binary_ks(actual_binary, scored_values)
     gini_value = float(2 * auc_value - 1) if auc_value is not None else None
     brier_value = _safe_binary_metric(
         lambda: float(brier_score_loss(actual_binary, scored_values))
     )
     mae_value = float(mean_absolute_error(actual_binary, scored_values))
-    hl_p_value = _hosmer_lemeshow_p_value(actual_binary, scored_values)
+    hl_p_value = hosmer_lemeshow_p_value(actual_binary, scored_values)
 
     threshold = bundle.model_threshold or 0.5
     predicted_class = (scored_values >= threshold).astype(int)
@@ -501,7 +950,7 @@ def _evaluate_tests(
     recall_value = _safe_binary_metric(
         lambda: float(recall_score(actual_binary, predicted_class, zero_division=0))
     )
-    band_mae = _bad_rate_by_band_mae(actual_binary, scored_values)
+    band_mae = bad_rate_by_band_mae(actual_binary, scored_values)
 
     results.extend(
         [
@@ -553,183 +1002,6 @@ def _evaluate_tests(
         ]
     )
     return results
-
-
-def _build_support_tables(
-    *,
-    raw_dataframe: pd.DataFrame,
-    current_predictions: pd.DataFrame | None,
-    reference_raw: pd.DataFrame | None,
-    reference_predictions: pd.DataFrame | None,
-    bundle: ModelBundle,
-    score_column: str | None,
-    actual_column: str | None,
-    segment_column: str | None,
-) -> dict[str, pd.DataFrame]:
-    tables: dict[str, pd.DataFrame] = {}
-    tables["model_metadata"] = pd.DataFrame(
-        [
-            {"field": "model_name", "value": bundle.display_name},
-            {"field": "model_version", "value": bundle.model_version},
-            {"field": "model_owner", "value": bundle.model_owner},
-            {"field": "business_purpose", "value": bundle.business_purpose},
-            {"field": "portfolio_name", "value": bundle.portfolio_name},
-            {"field": "segment_name", "value": bundle.segment_name},
-            {
-                "field": "approval_status",
-                "value": bundle.monitoring_metadata.approval_status or "n/a",
-            },
-            {
-                "field": "approval_date",
-                "value": bundle.monitoring_metadata.approval_date or "n/a",
-            },
-            {
-                "field": "monitoring_notes",
-                "value": bundle.monitoring_metadata.monitoring_notes or "n/a",
-            },
-            {"field": "metadata_source", "value": bundle.metadata_source},
-            {"field": "model_type", "value": bundle.model_type},
-            {"field": "target_mode", "value": bundle.target_mode},
-            {"field": "bundle_path", "value": str(bundle.bundle_paths.root)},
-            {"field": "reference_row_count", "value": bundle.reference_row_count},
-        ]
-    )
-
-    missingness = raw_dataframe.isna().mean().mul(100.0).reset_index()
-    missingness.columns = ["column_name", "current_missingness_pct"]
-    if reference_raw is not None:
-        reference_missingness = reference_raw.isna().mean().mul(100.0).reset_index()
-        reference_missingness.columns = ["column_name", "reference_missingness_pct"]
-        missingness = missingness.merge(reference_missingness, on="column_name", how="left")
-    tables["missingness_summary"] = missingness.sort_values(
-        "current_missingness_pct", ascending=False
-    ).reset_index(drop=True)
-
-    if (
-        score_column is not None
-        and current_predictions is not None
-        and score_column in current_predictions.columns
-    ):
-        current_scores = _numeric_series(current_predictions[score_column])
-        score_profile = pd.DataFrame(
-            [
-                {
-                    "population": "monitoring",
-                    "row_count": len(current_scores),
-                    "score_mean": float(current_scores.mean()) if len(current_scores) else None,
-                    "score_std": float(current_scores.std()) if len(current_scores) else None,
-                    "score_min": float(current_scores.min()) if len(current_scores) else None,
-                    "score_max": float(current_scores.max()) if len(current_scores) else None,
-                }
-            ]
-        )
-        if (
-            reference_predictions is not None
-            and bundle.reference_score_column is not None
-            and bundle.reference_score_column in reference_predictions.columns
-        ):
-            reference_scores = _numeric_series(reference_predictions[bundle.reference_score_column])
-            score_profile = pd.concat(
-                [
-                    pd.DataFrame(
-                        [
-                            {
-                                "population": "reference",
-                                "row_count": len(reference_scores),
-                                "score_mean": float(reference_scores.mean())
-                                if len(reference_scores)
-                                else None,
-                                "score_std": float(reference_scores.std())
-                                if len(reference_scores)
-                                else None,
-                                "score_min": float(reference_scores.min())
-                                if len(reference_scores)
-                                else None,
-                                "score_max": float(reference_scores.max())
-                                if len(reference_scores)
-                                else None,
-                            }
-                        ]
-                    ),
-                    score_profile,
-                ],
-                ignore_index=True,
-            )
-        tables["score_profile"] = score_profile
-
-        label_frame = _build_label_evaluation_frame(
-            current_predictions=current_predictions,
-            score_column=score_column,
-            actual_column=actual_column,
-        )
-        if not label_frame.empty:
-            tables["score_band_summary"] = _build_score_band_summary(
-                actual_values=label_frame["actual"],
-                score_values=label_frame["score"],
-            )
-
-    if segment_column and segment_column in raw_dataframe.columns:
-        current_segment = _build_segment_share_frame(
-            raw_dataframe[segment_column],
-            value_name="current_share_pct",
-        )
-        if reference_raw is not None and segment_column in reference_raw.columns:
-            reference_segment = _build_segment_share_frame(
-                reference_raw[segment_column],
-                value_name="reference_share_pct",
-            )
-            current_segment = current_segment.merge(
-                reference_segment, on="segment_value", how="outer"
-            ).fillna(0.0)
-        tables["segment_summary"] = current_segment.sort_values(
-            "current_share_pct", ascending=False
-        ).reset_index(drop=True)
-
-    if current_predictions is not None:
-        tables["scored_data_preview"] = current_predictions.head(50).copy(deep=True)
-    return tables
-
-
-def _build_score_band_summary(
-    *,
-    actual_values: pd.Series,
-    score_values: pd.Series,
-    band_count: int = 10,
-) -> pd.DataFrame:
-    quantiles = np.unique(np.quantile(score_values, np.linspace(0.0, 1.0, band_count + 1)))
-    if len(quantiles) < 3:
-        quantiles = np.linspace(float(score_values.min()), float(score_values.max()), band_count + 1)
-    quantiles[0] = -np.inf
-    quantiles[-1] = np.inf
-    band = pd.cut(score_values, bins=quantiles, include_lowest=True, duplicates="drop")
-    frame = pd.DataFrame({"score": score_values, "actual": actual_values, "band": band})
-    summary = (
-        frame.groupby("band", observed=False)
-        .agg(
-            observation_count=("score", "size"),
-            average_predicted_score=("score", "mean"),
-            observed_rate=("actual", "mean"),
-        )
-        .reset_index()
-    )
-    summary["bad_rate_abs_error"] = (
-        summary["average_predicted_score"] - summary["observed_rate"]
-    ).abs()
-    summary["band_label"] = summary["band"].astype(str)
-    return summary.drop(columns=["band"])
-
-
-def _build_segment_share_frame(values: pd.Series, *, value_name: str) -> pd.DataFrame:
-    frame = (
-        values.fillna("__MISSING__")
-        .astype(str)
-        .value_counts(dropna=False, normalize=True)
-        .mul(100.0)
-        .rename(value_name)
-        .reset_index()
-    )
-    frame.columns = ["segment_value", value_name]
-    return frame
 
 
 def _build_contract_failure_results(
@@ -862,14 +1134,14 @@ def _load_reference_raw(bundle: ModelBundle) -> pd.DataFrame | None:
     path = bundle.bundle_paths.reference_input_path
     if path is None or not path.exists():
         return None
-    return pd.read_csv(path)
+    return read_csv_cached(path)
 
 
 def _load_reference_predictions(bundle: ModelBundle) -> pd.DataFrame | None:
     path = bundle.bundle_paths.reference_predictions_path
     if path is None or not path.exists():
         return None
-    return pd.read_csv(path)
+    return read_csv_cached(path)
 
 
 def _resolve_actual_column(current_predictions: pd.DataFrame, bundle: ModelBundle) -> str | None:
@@ -879,129 +1151,17 @@ def _resolve_actual_column(current_predictions: pd.DataFrame, bundle: ModelBundl
     return None
 
 
-def _build_label_evaluation_frame(
-    *,
-    current_predictions: pd.DataFrame,
-    score_column: str,
-    actual_column: str | None,
-) -> pd.DataFrame:
-    if actual_column is None or actual_column not in current_predictions.columns:
-        return pd.DataFrame()
-
-    frame = pd.DataFrame(
-        {
-            "score": pd.to_numeric(current_predictions[score_column], errors="coerce"),
-            "actual": pd.to_numeric(current_predictions[actual_column], errors="coerce"),
-        }
-    ).dropna(subset=["score", "actual"])
-    return frame.reset_index(drop=True)
-
-
 def _labels_available_for_metrics(
     *,
     current_predictions: pd.DataFrame,
     score_column: str,
     actual_column: str | None,
 ) -> bool:
-    return not _build_label_evaluation_frame(
+    return not build_label_evaluation_frame(
         current_predictions=current_predictions,
         score_column=score_column,
         actual_column=actual_column,
     ).empty
-
-
-def _score_psi(reference_scores: pd.Series | None, current_scores: pd.Series) -> float | None:
-    if reference_scores is None or not len(reference_scores) or not len(current_scores):
-        return None
-
-    quantiles = np.unique(np.quantile(reference_scores, np.linspace(0.0, 1.0, 11)))
-    if len(quantiles) < 3:
-        quantiles = np.linspace(float(reference_scores.min()), float(reference_scores.max()), 11)
-    quantiles[0] = -np.inf
-    quantiles[-1] = np.inf
-    reference_buckets = pd.cut(reference_scores, bins=quantiles, include_lowest=True, duplicates="drop")
-    current_buckets = pd.cut(current_scores, bins=quantiles, include_lowest=True, duplicates="drop")
-    reference_dist = reference_buckets.value_counts(normalize=True, sort=False)
-    current_dist = current_buckets.value_counts(normalize=True, sort=False).reindex(
-        reference_dist.index, fill_value=0.0
-    )
-
-    epsilon = 1e-6
-    reference_arr = np.clip(reference_dist.to_numpy(dtype=float), epsilon, None)
-    current_arr = np.clip(current_dist.to_numpy(dtype=float), epsilon, None)
-    return float(np.sum((current_arr - reference_arr) * np.log(current_arr / reference_arr)))
-
-
-def _categorical_psi(reference_values: pd.Series, current_values: pd.Series) -> float:
-    reference_dist = (
-        reference_values.fillna("__MISSING__").astype(str).value_counts(normalize=True, sort=False)
-    )
-    current_dist = (
-        current_values.fillna("__MISSING__").astype(str).value_counts(normalize=True, sort=False)
-    )
-    all_categories = reference_dist.index.union(current_dist.index)
-    epsilon = 1e-6
-    reference_arr = np.clip(
-        reference_dist.reindex(all_categories, fill_value=0.0).to_numpy(dtype=float), epsilon, None
-    )
-    current_arr = np.clip(
-        current_dist.reindex(all_categories, fill_value=0.0).to_numpy(dtype=float), epsilon, None
-    )
-    return float(np.sum((current_arr - reference_arr) * np.log(current_arr / reference_arr)))
-
-
-def _binary_ks(actual_values: pd.Series, score_values: pd.Series) -> float | None:
-    positives = score_values[actual_values == 1]
-    negatives = score_values[actual_values == 0]
-    if not len(positives) or not len(negatives):
-        return None
-    all_scores = np.sort(np.unique(score_values))
-    positive_cdf = np.searchsorted(np.sort(positives), all_scores, side="right") / len(positives)
-    negative_cdf = np.searchsorted(np.sort(negatives), all_scores, side="right") / len(negatives)
-    return float(np.max(np.abs(positive_cdf - negative_cdf)))
-
-
-def _hosmer_lemeshow_p_value(
-    actual_values: pd.Series,
-    score_values: pd.Series,
-    groups: int = 10,
-) -> float | None:
-    if score_values.nunique() < 2:
-        return None
-    frame = pd.DataFrame({"actual": actual_values, "score": score_values}).copy(deep=True)
-    try:
-        frame["group"] = pd.qcut(frame["score"], q=groups, duplicates="drop")
-    except ValueError:
-        return None
-
-    summary = (
-        frame.groupby("group", observed=False)
-        .agg(observed=("actual", "sum"), expected=("score", "sum"), count=("actual", "size"))
-        .reset_index(drop=True)
-    )
-    summary["observed_non_events"] = summary["count"] - summary["observed"]
-    summary["expected_non_events"] = summary["count"] - summary["expected"]
-    epsilon = 1e-6
-    statistic = (
-        ((summary["observed"] - summary["expected"]) ** 2)
-        / np.clip(summary["expected"], epsilon, None)
-        + ((summary["observed_non_events"] - summary["expected_non_events"]) ** 2)
-        / np.clip(summary["expected_non_events"], epsilon, None)
-    ).sum()
-    degrees_freedom = max(len(summary) - 2, 1)
-    return float(chi2.sf(statistic, degrees_freedom))
-
-
-def _bad_rate_by_band_mae(actual_values: pd.Series, score_values: pd.Series) -> float | None:
-    summary = _build_score_band_summary(actual_values=actual_values, score_values=score_values)
-    if summary.empty:
-        return None
-    return float(summary["bad_rate_abs_error"].mean())
-
-
-def _numeric_series(values: pd.Series) -> pd.Series:
-    numeric = pd.to_numeric(values, errors="coerce")
-    return numeric.dropna().reset_index(drop=True)
 
 
 def _safe_binary_metric(metric) -> float | None:
@@ -1017,6 +1177,11 @@ def _safe_binary_metric(metric) -> float | None:
 def _read_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, default=str)
 
 
 def _extract_failure_details(exc: Exception) -> tuple[str, str | None, dict[str, Any]]:

@@ -1,0 +1,57 @@
+{
+  "contract_failed": {
+    "failure_stage": "input_contract",
+    "labels_available": false,
+    "report": true,
+    "reviewer_package": true,
+    "run_config": true,
+    "status": "contract_failed",
+    "step_manifest": true,
+    "run_debug_trace": true,
+    "workbook": true
+  },
+  "happy_path": {
+    "failure_stage": null,
+    "labels_available": true,
+    "report": true,
+    "reviewer_package": true,
+    "run_config": true,
+    "status": "completed",
+    "step_manifest": true,
+    "run_debug_trace": true,
+    "workbook": true
+  },
+  "minimal_artifacts": {
+    "failure_stage": null,
+    "labels_available": true,
+    "report": true,
+    "reviewer_package": false,
+    "run_config": true,
+    "status": "completed",
+    "step_manifest": true,
+    "run_debug_trace": true,
+    "workbook": true
+  },
+  "outcome_join": {
+    "failure_stage": null,
+    "labels_available": true,
+    "report": true,
+    "reviewer_package": true,
+    "run_config": true,
+    "status": "completed",
+    "step_manifest": true,
+    "run_debug_trace": true,
+    "workbook": true
+  },
+  "score_only": {
+    "failure_stage": null,
+    "labels_available": false,
+    "report": true,
+    "reviewer_package": true,
+    "run_config": true,
+    "status": "completed",
+    "step_manifest": true,
+    "run_debug_trace": true,
+    "workbook": true
+  }
+}

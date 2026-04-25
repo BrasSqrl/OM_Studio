@@ -587,3 +587,453 @@ They must not introduce:
 - scheduled monitoring
 - external services or storage
 - persistent run comparison beyond the current session
+
+### Phase 9: Monitoring Bundle Depth And Reviewer Artifacts
+- prefer a first-class `monitoring_bundle/` intake shape when exported by the sister project while continuing to support existing compliant bundle directories
+- add feature-level drift tests and supporting tables for numeric and categorical raw input fields
+- add data-quality threshold tests for duplicate identifiers, identifier nulls, invalid dates, stale monitoring dates, unexpected categories, numeric range violations, and absolute row count
+- support an optional outcome-file join so realized labels can be supplied separately from scoring data
+- make per-model test enablement explicit in saved threshold snapshots and exported reviewer artifacts
+- persist a lightweight run manifest index under `runs/` for reviewer traceability without adding a database or cross-session comparison workflow
+- allow reviewer exception notes to be captured at run time and exported with test results
+- add reference-baseline diagnostics for required reference artifacts, rows, score columns, labels, and date coverage
+- add an executive summary sheet and report section focused on run status, test counts, and failed-test names
+- add a lightweight UI regression checklist/screenshot script for consistent manual checks of the narrow workflow
+
+## Next Monitoring Depth Roadmap
+
+These items improve reviewer coverage and operational traceability while keeping OM Studio focused on existing approved model bundles and uploaded monitoring data.
+
+### Workstream 1: First-Class Monitoring Bundle Intake
+
+Objective:
+- consume a sister-project `monitoring_bundle/` output directory as the preferred contract for OM Studio
+
+Deliverables:
+- detect bundles whose root is named `monitoring_bundle`
+- surface preferred-vs-legacy bundle shape in compatibility findings
+- keep existing compliant bundle directories runnable
+
+Acceptance:
+- a `models/<model>/monitoring_bundle/` directory with the required files appears as a runnable bundle and is marked as the preferred intake shape
+
+### Workstream 2: Feature-Level Drift Tests
+
+Objective:
+- show which raw features drifted, not only whether the score distribution drifted
+
+Deliverables:
+- compute per-feature PSI for numeric and categorical bundle features
+- compute numeric-feature KS p-values where applicable
+- add threshold-backed tests for max feature PSI and minimum numeric feature KS p-value
+- export the feature drift table to CSV, Excel, and HTML
+
+Acceptance:
+- every run with a reference input snapshot includes feature-level drift diagnostics and per-test pass/fail results
+
+### Workstream 3: Data-Quality Threshold Tests
+
+Objective:
+- catch common monitoring-data issues before relying on model performance diagnostics
+
+Deliverables:
+- add threshold-backed tests for absolute row count, duplicate identifiers, identifier null rate, invalid dates, stale as-of dates, unexpected categories, and numeric range violations
+- export a data-quality summary table
+- keep defaults editable and persisted per model
+
+Acceptance:
+- data-quality tests appear in the same threshold editor and run results as existing monitoring tests
+
+### Workstream 4: Optional Outcome-File Join
+
+Objective:
+- allow labels to be supplied in a separate watched dataset without requiring users to edit the scoring input file
+
+Deliverables:
+- add an optional outcome dataset selector in the Run tab
+- infer sensible join keys from identifier and date columns
+- merge the label column into the scoring input before contract validation and scoring
+- export an outcome join summary table
+
+Acceptance:
+- a score-only input dataset can become a full monitoring run when a matching outcome file supplies the saved label column
+
+### Workstream 5: Per-Model Test Enablement Profile
+
+Objective:
+- make enabled/disabled tests auditable as a per-model monitoring profile
+
+Deliverables:
+- preserve the existing per-model threshold persistence
+- export an explicit test enablement profile table and artifact
+- include disabled tests as `N/A` with clear detail
+
+Acceptance:
+- reviewers can see which tests were active for the model at run time without inspecting the UI state
+
+### Workstream 6: Run Manifest Persistence
+
+Objective:
+- create durable run traceability without adding a database or cross-session comparison feature
+
+Deliverables:
+- write or update `runs/index.json` after each run
+- include run id, timestamp, model, dataset, status, counts, and artifact paths
+- show persisted run records in the History tab as read-only context
+
+Acceptance:
+- closing and reopening the app does not erase basic run traceability from disk
+
+### Workstream 7: Reviewer Exception Notes
+
+Objective:
+- let reviewers document test-level exceptions or remediation context in the exported package
+
+Deliverables:
+- add a small notes editor in the Run tab keyed by test id
+- carry notes into test-result exports, JSON, workbook, HTML, and reviewer package
+- avoid introducing approval workflow state
+
+Acceptance:
+- a reviewer note entered for a test appears in the generated artifacts for that run
+
+### Workstream 8: Reference-Baseline Diagnostics
+
+Objective:
+- make the quality of the reference baseline visible before and after a run
+
+Deliverables:
+- summarize reference input and prediction artifact availability
+- report reference rows, score column, label availability, and date coverage
+- surface the diagnostics in the Overview tab and exported artifacts
+
+Acceptance:
+- reviewers can identify weak or incomplete reference baselines without opening raw bundle files
+
+### Workstream 9: Report Executive Summary
+
+Objective:
+- put the reviewer decision summary first in exported artifacts
+
+Deliverables:
+- add an executive summary table with status, counts, score mode, and failed-test names
+- make it the first workbook sheet
+- add an executive summary section near the top of the HTML report
+
+Acceptance:
+- a reviewer can open the report or workbook and immediately see the run outcome and failed tests
+
+### Workstream 10: UI Regression Checklist
+
+Objective:
+- give a repeatable way to check the narrow UI workflow after design or logic changes
+
+Deliverables:
+- define the expected UI states to capture
+- provide an optional screenshot script for a running local Streamlit app
+- keep this as local tooling only, with no production dependency
+
+Acceptance:
+- contributors have a documented checklist and optional script for validating the main UI states
+
+### Recommended Implementation Order
+
+1. First-class monitoring bundle intake
+2. Feature-level drift tests
+3. Data-quality threshold tests
+4. Outcome-file join workflow
+5. Per-model test enablement profile
+6. Run manifest persistence
+7. Reviewer exception notes
+8. Reference-baseline diagnostics
+9. Report executive summary
+10. UI regression checklist
+
+### Delivery Rule
+
+These enhancements must stay inside the original OM Studio scope.
+
+They must not introduce:
+- model training
+- challenger workflows
+- scheduled runs
+- external services
+- external databases
+- authentication or multi-user review state
+
+### Phase 10: Runtime Optimization And Debuggability
+- split high-growth execution logic into smaller modules for metrics, support tables, telemetry, and artifact settings
+- add run-stage telemetry so every run exports stage timings and debug events
+- cache file-derived state using path, size, and modified-time keys to avoid repeated reads and hashes
+- centralize data-quality and feature-drift profile construction so tests and support tables reuse the same calculations
+- add configurable artifact profiles to reduce unnecessary report/support-output work during faster reruns
+- keep subprocess scoring as the compatibility-first default while preserving an extension point for future direct in-process scoring
+- add a local profiling script for repeatable demo and large-row runtime analysis
+
+## Next Runtime Optimization Roadmap
+
+These items make OM Studio easier to debug and faster to run without changing its narrow purpose.
+
+### Workstream 1: Smaller Execution Modules
+
+Objective:
+- reduce the size and responsibility overlap in the pipeline module
+
+Deliverables:
+- move run telemetry into a dedicated module
+- move feature drift and data-quality profiles into a dedicated metrics module
+- move support-table assembly into a dedicated support module
+- keep the public `execute_monitoring_run` API stable
+
+Acceptance:
+- pipeline orchestration reads as load -> validate -> score -> test -> report, with lower-level details delegated to focused modules
+
+### Workstream 2: Stage-Level Telemetry
+
+Objective:
+- make slow or failing runs easy to diagnose from exported artifacts
+
+Deliverables:
+- capture timing events for dataset load, outcome join, validation, scoring, reference loading, test evaluation, support-table assembly, artifact writing, and run-index persistence
+- write `run_events.jsonl` under each run directory
+- include telemetry in the artifact manifest and reviewer package
+
+Acceptance:
+- every run folder contains a readable event log showing stage duration and status
+
+### Workstream 3: File-Derived Caching
+
+Objective:
+- avoid repeated reads and hashes of unchanged local files
+
+Deliverables:
+- cache dataset header reads by path, size, and modified time
+- cache CSV reference reads by path, size, and modified time
+- cache file SHA256 values by path, size, and modified time
+- return defensive DataFrame copies to avoid shared-state mutation
+
+Acceptance:
+- repeated UI refreshes and repeated diagnostics avoid redundant disk work when files are unchanged
+
+### Workstream 4: Reusable Metric Profiles
+
+Objective:
+- compute raw-data profiles once and reuse them for tests, support tables, and reports
+
+Deliverables:
+- centralize data-quality summary construction
+- centralize feature-drift summary construction
+- keep existing threshold outputs unchanged
+
+Acceptance:
+- data-quality and feature-drift tests use the same tables exported to artifacts
+
+### Workstream 5: Artifact Profiles
+
+Objective:
+- reduce runtime when users only need the primary reviewer artifacts
+
+Deliverables:
+- add an artifact profile setting with `full`, `reviewer`, and `minimal`
+- keep HTML report and Excel workbook in all profiles
+- skip non-essential support CSVs and reviewer zip where configured
+
+Acceptance:
+- users can reduce run-output work without losing the stitched report and workbook
+
+### Workstream 6: Profiling Tooling
+
+Objective:
+- make future runtime changes measurable
+
+Deliverables:
+- add a local profiling script for demo monitoring runs
+- support configurable monitoring row counts
+- print stage outputs and cProfile top functions
+
+Acceptance:
+- contributors can run one command and see where runtime is being spent
+
+### Recommended Implementation Order
+
+1. Stage-level telemetry
+2. File-derived caching
+3. Reusable metric profiles
+4. Smaller execution modules
+5. Artifact profiles
+6. Profiling tooling
+
+### Delivery Rule
+
+These changes must preserve:
+- raw-data-only monitoring
+- compliant bundle intake
+- HTML and Excel reviewer outputs
+- per-test pass/fail threshold semantics
+
+### Phase 11: Reviewer Hardening And Narrow Workflow Refinement
+- add explicit monitoring bundle contract versioning so users can distinguish supported, deprecated, missing, and unsupported bundle exports
+- add a downloadable run-comparison export for two current-session runs
+- add a structured reviewer exception workflow that remains run-scoped and does not become an approval system
+- add threshold change audit logging for per-model benchmark edits
+- add an artifact completeness checker that verifies expected run outputs were generated or intentionally skipped
+- add a model bundle intake checklist for reviewer-facing bundle readiness
+- add large dataset guardrails that warn or block based on row/column size limits
+- add a test applicability matrix so reviewers can see why each test ran, failed, or was marked `N/A`
+- polish reviewer reports so decision summaries, exceptions, intake status, applicability, and artifact completeness are easy to find
+- add a one-click diagnostic export package for run debugging
+
+## Next Reviewer Hardening Roadmap
+
+These items improve reviewer confidence and troubleshooting speed while preserving the original narrow workflow: select a compliant exported model bundle, select watched monitoring data, validate, run, review per-test pass/fail, and download artifacts.
+
+### Workstream 1: Bundle Contract Versioning
+
+Objective:
+- make the sister-project bundle contract explicit and future-safe
+
+Deliverables:
+- supported contract version policy in code
+- compatibility findings for missing, supported, deprecated, future, or unsupported bundle versions
+- version status surfaced in the UI and exported metadata
+
+Acceptance:
+- a user can tell whether an uploaded bundle uses a supported OM Studio intake contract before running it
+
+### Workstream 2: Run Comparison Export
+
+Objective:
+- let reviewers preserve current-session run comparisons without manually copying tables
+
+Deliverables:
+- downloadable HTML comparison
+- downloadable Excel workbook comparison
+- summary and changed-test tables
+
+Acceptance:
+- two current-session runs can be selected and exported as reviewer-facing comparison artifacts
+
+### Workstream 3: Reviewer Exception Workflow
+
+Objective:
+- let reviewers document test-level exceptions without adding approvals or multi-user state
+
+Deliverables:
+- run-scoped exception disposition and rationale fields
+- exception details exported to JSON, CSV, Excel, HTML, and reviewer package
+- exception summary in the UI and report
+
+Acceptance:
+- a failed or `N/A` test can carry reviewer context in the run artifacts
+
+### Workstream 4: Threshold Change Audit
+
+Objective:
+- make per-model threshold edits traceable
+
+Deliverables:
+- JSONL audit log under `thresholds/audit/`
+- changed value/enabled/operator fields captured per save
+- UI view of recent threshold audit events
+
+Acceptance:
+- reviewers can see when saved thresholds changed and what changed
+
+### Workstream 5: Artifact Completeness Checker
+
+Objective:
+- make generated, missing, and skipped run artifacts explicit
+
+Deliverables:
+- `artifact_completeness.csv`
+- `artifact_completeness.json`
+- completeness status in the manifest, report, workbook, UI, reviewer package, and diagnostic package
+
+Acceptance:
+- a run folder explains whether expected artifacts exist or were intentionally skipped by profile
+
+### Workstream 6: Model Bundle Intake Checklist
+
+Objective:
+- convert compatibility findings into a simple reviewer checklist
+
+Deliverables:
+- required/recommended file checklist
+- metadata, target, schema, reference, and version checklist rows
+- UI and exported artifact coverage
+
+Acceptance:
+- a reviewer can inspect intake readiness without interpreting raw bundle files
+
+### Workstream 7: Large Dataset Guardrails
+
+Objective:
+- reduce avoidable slow or memory-heavy runs
+
+Deliverables:
+- warning thresholds for large row/column counts
+- hard-stop thresholds for oversized row/column counts
+- guardrail table in validation UI
+
+Acceptance:
+- users are warned before heavy runs and blocked before configured oversized runs
+
+### Workstream 8: Test Applicability Matrix
+
+Objective:
+- explain why each test ran, was disabled, or returned `N/A`
+
+Deliverables:
+- per-test applicability table tied to thresholds and actual run results
+- workbook, report, UI, and reviewer package inclusion
+
+Acceptance:
+- reviewers can see the reason behind every active, disabled, or unavailable test
+
+### Workstream 9: Reviewer Report Polish
+
+Objective:
+- make exported reports more decision-oriented
+
+Deliverables:
+- prominent failed-test and exception summary
+- intake checklist, applicability, and artifact completeness sections
+- clearer reviewer action context
+
+Acceptance:
+- the HTML and Excel reports put reviewer decisions and caveats before lower-level diagnostics
+
+### Workstream 10: Diagnostic Export Package
+
+Objective:
+- make run debugging portable without requiring users to zip files manually
+
+Deliverables:
+- `diagnostic_export.zip`
+- inclusion of manifests, telemetry, debug traces, failure diagnostics, contract, thresholds, provenance, completeness, and tests
+- UI download action
+
+Acceptance:
+- a failed or questionable run can be shared for debugging with one download
+
+### Recommended Implementation Order
+
+1. Bundle contract versioning
+2. Model bundle intake checklist
+3. Large dataset guardrails
+4. Test applicability matrix
+5. Threshold change audit
+6. Reviewer exception workflow
+7. Artifact completeness checker
+8. Diagnostic export package
+9. Run comparison export
+10. Reviewer report polish
+
+### Delivery Rule
+
+These changes must not introduce:
+- model training or challenger workflows
+- scheduled monitoring
+- external services or databases
+- authentication or multi-user workflow state
+- persistent comparison workflow beyond current-session exports

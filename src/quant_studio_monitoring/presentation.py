@@ -30,14 +30,14 @@ def apply_fintech_figure_theme(
         colorway=FINTECH_COLORWAY,
         height=height,
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#FFFDFC",
+        plot_bgcolor="#FFFFFF",
         margin={"l": 24, "r": 24, "t": 68, "b": 24},
-        font={"family": "Aptos, Segoe UI, sans-serif", "color": "#112033"},
-        title_font={"size": 20},
+        font={"family": "Aptos, Segoe UI, sans-serif", "color": "#1F2A44"},
+        title_font={"size": 18},
         legend={"orientation": "h", "y": -0.2},
     )
-    figure.update_xaxes(showgrid=True, gridcolor="rgba(17, 32, 51, 0.08)")
-    figure.update_yaxes(showgrid=True, gridcolor="rgba(17, 32, 51, 0.08)")
+    figure.update_xaxes(showgrid=True, gridcolor="rgba(129, 145, 168, 0.16)")
+    figure.update_yaxes(showgrid=True, gridcolor="rgba(129, 145, 168, 0.16)")
     return figure
 
 
@@ -551,6 +551,431 @@ def inject_styles() -> None:
               font-size: 0.95rem;
             }
           }
+          :root {
+            --om-bg: #f4f7fb;
+            --om-surface: #ffffff;
+            --om-surface-muted: #f7faff;
+            --om-border: #dce5f1;
+            --om-border-strong: #c8d5e8;
+            --om-text: #1f2a44;
+            --om-muted: #6a7891;
+            --om-accent: #2e6deb;
+            --om-accent-strong: #1f5cd1;
+            --om-accent-soft: #edf4ff;
+            --om-success: #1f9d67;
+            --om-success-soft: #ecf8f2;
+            --om-warning-soft: #fff7e8;
+            --om-danger-soft: #fff1f1;
+            --om-neutral-soft: #f1f5fb;
+            --om-shadow: 0 10px 28px rgba(18, 33, 64, 0.06);
+            --om-shadow-tight: 0 6px 16px rgba(18, 33, 64, 0.05);
+          }
+          .stApp {
+            background: linear-gradient(180deg, #f8fbff 0%, var(--om-bg) 100%);
+            color: var(--om-text);
+          }
+          [data-testid="stSidebar"] {
+            background: var(--om-surface);
+            border-right: 1px solid var(--om-border);
+          }
+          [data-testid="stSidebar"] > div:first-child {
+            background: var(--om-surface);
+          }
+          .block-container {
+            max-width: 1560px;
+            padding-top: 1rem;
+          }
+          .hero-shell {
+            margin-bottom: 1rem;
+          }
+          .hero-card,
+          .sidepanel-card,
+          .readiness-banner,
+          .outcome-card,
+          .step-tracker-card,
+          .empty-state-card,
+          .control-deck-card,
+          .decision-card,
+          .tab-intro-card {
+            background: var(--om-surface);
+            border-color: var(--om-border);
+            border-radius: 18px;
+            box-shadow: var(--om-shadow-tight);
+          }
+          .hero-card {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1.25rem;
+            padding: 1rem 1.2rem;
+          }
+          .hero-brand {
+            display: flex;
+            align-items: center;
+            gap: 0.95rem;
+            min-width: 0;
+          }
+          .hero-brandmark {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 2.7rem;
+            height: 2.7rem;
+            border-radius: 14px;
+            background: linear-gradient(135deg, var(--om-accent), #4f8cff);
+            color: #ffffff;
+            font-size: 0.92rem;
+            font-weight: 800;
+            letter-spacing: 0.04em;
+            box-shadow: 0 10px 20px rgba(46, 109, 235, 0.22);
+            flex: 0 0 auto;
+          }
+          .hero-copy {
+            min-width: 0;
+          }
+          .hero-kicker,
+          .sidepanel-kicker,
+          .readiness-kicker,
+          .outcome-kicker,
+          .step-tracker-kicker,
+          .empty-state-kicker,
+          .control-deck-kicker,
+          .decision-kicker,
+          .tab-intro-kicker,
+          .workspace-nav-kicker,
+          .section-kicker {
+            color: var(--om-accent);
+            font-size: 0.68rem;
+            letter-spacing: 0.12em;
+            font-weight: 700;
+          }
+          .hero-card h1 {
+            font-size: 1.45rem;
+            line-height: 1.1;
+          }
+          .hero-card p,
+          .sidepanel-card p,
+          .decision-card p,
+          .tab-intro-card p,
+          .workspace-nav-strip p {
+            color: var(--om-muted);
+            font-size: 0.9rem;
+          }
+          .hero-toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.55rem;
+            justify-content: flex-end;
+          }
+          .workspace-toolbar-card {
+            padding: 0.78rem 0.95rem;
+            margin-bottom: 0.6rem;
+            border: 1px solid var(--om-border);
+            border-radius: 16px;
+            background: var(--om-surface);
+            box-shadow: var(--om-shadow-tight);
+          }
+          .workspace-toolbar-kicker {
+            color: var(--om-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-size: 0.67rem;
+            font-weight: 700;
+            margin-bottom: 0.18rem;
+          }
+          .workspace-toolbar-card h3 {
+            margin: 0;
+            color: var(--om-text);
+            font-size: 1rem;
+            line-height: 1.2;
+          }
+          .workflow-stage-card {
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr);
+            gap: 1rem;
+            align-items: start;
+            padding: 1rem 1.05rem;
+            margin-bottom: 0.85rem;
+            border: 1px solid var(--om-border);
+            border-radius: 18px;
+            background: var(--om-surface);
+            box-shadow: var(--om-shadow-tight);
+          }
+          .workflow-stage-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 2rem;
+            height: 2rem;
+            border-radius: 12px;
+            background: var(--om-accent-soft);
+            color: var(--om-accent-strong);
+            font-size: 0.92rem;
+            font-weight: 800;
+            line-height: 1;
+          }
+          .workflow-stage-copy {
+            min-width: 0;
+          }
+          .workflow-stage-kicker {
+            color: var(--om-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-size: 0.67rem;
+            font-weight: 700;
+            margin-bottom: 0.2rem;
+          }
+          .workflow-stage-copy h3 {
+            margin: 0;
+            color: var(--om-text);
+            font-size: 1.08rem;
+            line-height: 1.25;
+          }
+          .workflow-stage-copy p {
+            margin: 0.35rem 0 0;
+            color: var(--om-muted);
+            font-size: 0.86rem;
+            line-height: 1.45;
+          }
+          .summary-tile-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 0.95rem;
+          }
+          .summary-tile {
+            padding: 0.92rem 0.95rem;
+            border-radius: 16px;
+            border: 1px solid var(--om-border);
+            background: var(--om-surface);
+            box-shadow: var(--om-shadow-tight);
+          }
+          .summary-tile span {
+            display: block;
+            color: var(--om-muted);
+            font-size: 0.68rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+          }
+          .summary-tile strong {
+            display: block;
+            margin-top: 0.45rem;
+            color: var(--om-text);
+            font-size: 1rem;
+            line-height: 1.25;
+          }
+          .summary-tile p {
+            margin: 0.3rem 0 0;
+            color: var(--om-muted);
+            font-size: 0.8rem;
+            line-height: 1.4;
+          }
+          .summary-tile--ready {
+            background: linear-gradient(180deg, #ffffff 0%, var(--om-success-soft) 100%);
+          }
+          .summary-tile--warning,
+          .summary-tile--score_only {
+            background: linear-gradient(180deg, #ffffff 0%, var(--om-warning-soft) 100%);
+          }
+          .summary-tile--blocked,
+          .summary-tile--contract_failed,
+          .summary-tile--execution_failed,
+          .summary-tile--fail {
+            background: linear-gradient(180deg, #ffffff 0%, var(--om-danger-soft) 100%);
+          }
+          .summary-tile--completed,
+          .summary-tile--current,
+          .summary-tile--neutral {
+            background: linear-gradient(180deg, #ffffff 0%, var(--om-accent-soft) 100%);
+          }
+          .hero-chip,
+          .workspace-nav-tip {
+            background: var(--om-surface-muted);
+            border-color: var(--om-border);
+            color: var(--om-text);
+            font-size: 0.8rem;
+            font-weight: 600;
+            box-shadow: none;
+          }
+          .workspace-nav-strip {
+            margin-top: 0.65rem;
+          }
+          .mini-stat,
+          .outcome-metric,
+          .decision-next,
+          .step {
+            background: var(--om-surface-muted);
+            border-color: var(--om-border);
+            border-radius: 14px;
+          }
+          .mini-stat-value,
+          .step-number {
+            background: var(--om-accent-soft);
+            color: var(--om-accent-strong);
+          }
+          .mini-stat-label,
+          .step-body span,
+          .step-marker,
+          .outcome-metric span,
+          .decision-next span {
+            color: var(--om-muted);
+          }
+          .status-chip {
+            border-color: var(--om-border);
+            font-size: 0.78rem;
+            font-weight: 600;
+          }
+          .status-chip--pass,
+          .status-chip--ready {
+            background: var(--om-success-soft);
+            color: #1c7c52;
+            border-color: rgba(31, 157, 103, 0.18);
+          }
+          .status-chip--warning,
+          .status-chip--score_only {
+            background: var(--om-warning-soft);
+            color: #8d6117;
+            border-color: rgba(174, 116, 20, 0.18);
+          }
+          .status-chip--fail,
+          .status-chip--blocked {
+            background: var(--om-danger-soft);
+            color: #a84848;
+            border-color: rgba(195, 79, 79, 0.18);
+          }
+          .status-chip--na {
+            background: var(--om-neutral-soft);
+            color: #55657e;
+            border-color: rgba(129, 145, 168, 0.18);
+          }
+          .decision-card--ready,
+          .decision-card--completed,
+          .readiness-banner--ready,
+          .step--complete {
+            background: linear-gradient(180deg, #ffffff 0%, var(--om-success-soft) 100%);
+          }
+          .decision-card--score_only,
+          .decision-card--current,
+          .step--current {
+            background: linear-gradient(180deg, #ffffff 0%, var(--om-accent-soft) 100%);
+          }
+          .decision-card--blocked,
+          .readiness-banner--blocked,
+          .step--blocked {
+            background: linear-gradient(180deg, #ffffff 0%, var(--om-danger-soft) 100%);
+          }
+          div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+            padding: 0.15rem 0;
+            border-radius: 0;
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            gap: 0.5rem;
+          }
+          div[data-testid="stTabs"] [data-baseweb="tab"] {
+            flex: 0 0 auto;
+            min-height: 2.5rem;
+            padding: 0.48rem 0.82rem;
+            border-radius: 10px;
+            background: var(--om-surface);
+            border: 1px solid var(--om-border);
+          }
+          div[data-testid="stTabs"] [data-baseweb="tab"]:hover {
+            background: #edf3fb;
+          }
+          div[data-testid="stTabs"] [data-baseweb="tab"] p {
+            color: var(--om-muted);
+            font-size: 0.82rem;
+          }
+          div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
+            background: var(--om-accent-soft);
+            border-color: rgba(46, 109, 235, 0.18);
+            box-shadow: none;
+          }
+          div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] p {
+            color: var(--om-accent-strong);
+          }
+          .stButton > button,
+          .stDownloadButton > button {
+            min-height: 2.7rem;
+            border-radius: 12px;
+            border: 1px solid var(--om-border);
+            background: var(--om-surface);
+            color: var(--om-text);
+            font-weight: 700;
+          }
+          .stButton > button[kind="primary"],
+          .stDownloadButton > button[kind="primary"] {
+            background: linear-gradient(135deg, var(--om-accent), #4f8cff);
+            color: #ffffff;
+            border-color: rgba(46, 109, 235, 0.26);
+            box-shadow: 0 10px 22px rgba(46, 109, 235, 0.18);
+          }
+          .stButton > button:disabled,
+          .stDownloadButton > button:disabled {
+            background: #f3f6fb;
+            color: #8a96a8;
+          }
+          .stSelectbox > label,
+          .stTextInput > label,
+          .stNumberInput > label,
+          .stDateInput > label,
+          .stMultiSelect > label,
+          .stToggle > label,
+          .stRadio > label {
+            color: var(--om-muted);
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-weight: 700;
+          }
+          div[data-baseweb="select"] > div,
+          .stTextInput input,
+          .stNumberInput input,
+          .stDateInput input,
+          .stMultiSelect [data-baseweb="select"] > div {
+            border-radius: 14px !important;
+            border-color: var(--om-border) !important;
+            background: var(--om-surface) !important;
+            min-height: 3.15rem;
+            box-shadow: none !important;
+          }
+          div[data-baseweb="select"] > div:hover,
+          .stTextInput input:hover,
+          .stNumberInput input:hover,
+          .stDateInput input:hover,
+          .stMultiSelect [data-baseweb="select"] > div:hover {
+            border-color: var(--om-border-strong) !important;
+          }
+          div[data-testid="stDataFrame"],
+          div[data-testid="stTable"],
+          div[data-testid="stExpander"] details,
+          div[data-testid="stAlert"] {
+            border: 1px solid var(--om-border);
+            border-radius: 14px;
+            background: var(--om-surface);
+            box-shadow: var(--om-shadow-tight);
+          }
+          div[data-testid="stExpander"] summary {
+            color: var(--om-text);
+            font-weight: 700;
+          }
+          @media (max-width: 1180px) {
+            .hero-card {
+              flex-direction: column;
+              align-items: flex-start;
+            }
+            .hero-toolbar {
+              justify-content: flex-start;
+            }
+            .summary-tile-grid {
+              grid-template-columns: 1fr;
+            }
+            div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+              flex-wrap: wrap;
+            }
+          }
         </style>
         """,
         unsafe_allow_html=True,
@@ -562,17 +987,20 @@ def render_header() -> None:
         """
         <section class="hero-shell">
           <div class="hero-card">
-            <div class="hero-kicker">Ongoing Monitoring Workspace</div>
-            <h1>OM Studio</h1>
-            <p>
-              Drop approved model bundles into the workspace, drop monitoring data
-              into the watched inbox, and run test-level monitoring with exportable
-              reviewer-ready artifacts.
-            </p>
-            <div class="hero-chip-row">
-              <span class="hero-chip">Compliant bundle discovery</span>
-              <span class="hero-chip">Raw-data scoring only</span>
-              <span class="hero-chip">Per-test pass or fail</span>
+            <div class="hero-brand">
+              <div class="hero-brandmark">OM</div>
+              <div class="hero-copy">
+                <div class="hero-kicker">Ongoing Monitoring Workspace</div>
+                <h1>OM Studio</h1>
+                <p>
+                  Configure, validate, and run ongoing monitoring from approved model bundles with reviewer-ready outputs.
+                </p>
+              </div>
+            </div>
+            <div class="hero-toolbar">
+              <span class="hero-chip">Bundle Registry</span>
+              <span class="hero-chip">Raw-Data Monitoring</span>
+              <span class="hero-chip">Reviewer Outputs</span>
             </div>
           </div>
         </section>

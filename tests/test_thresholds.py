@@ -8,7 +8,13 @@ import pandas as pd
 
 from quant_studio_monitoring.config import WorkspaceConfig
 from quant_studio_monitoring.registry import discover_model_bundles
-from quant_studio_monitoring.thresholds import load_threshold_records, save_threshold_records
+from quant_studio_monitoring.thresholds import (
+    build_threshold_workbook_bytes,
+    load_threshold_audit_frame,
+    load_threshold_records,
+    save_threshold_records,
+    threshold_records_from_workbook_bytes,
+)
 
 
 def test_threshold_round_trip() -> None:
@@ -27,6 +33,8 @@ def test_threshold_round_trip() -> None:
     bundle = discover_model_bundles(workspace)[0]
 
     records = load_threshold_records(workspace.thresholds_root, bundle)
+    assert any(record.test_id == "max_feature_psi" for record in records)
+    assert any(record.test_id == "duplicate_identifier_count" for record in records)
     score_psi = next(record for record in records if record.test_id == "score_psi")
     score_psi.value = 0.2
     saved_path = save_threshold_records(workspace.thresholds_root, bundle, records)
@@ -34,6 +42,34 @@ def test_threshold_round_trip() -> None:
 
     assert saved_path.exists()
     assert next(record for record in reloaded if record.test_id == "score_psi").value == 0.2
+
+    audit = load_threshold_audit_frame(workspace.thresholds_root, bundle)
+    assert not audit.empty
+    assert audit.loc[0, "change_count"] >= 1
+    assert "score_psi" in audit.loc[0, "changed_tests"]
+
+
+def test_threshold_workbook_round_trips() -> None:
+    tmp_path = _make_test_root("threshold_workbook")
+    workspace = WorkspaceConfig(
+        project_root=tmp_path,
+        models_root=tmp_path / "models",
+        incoming_data_root=tmp_path / "incoming_data",
+        thresholds_root=tmp_path / "thresholds",
+        runs_root=tmp_path / "runs",
+    )
+    workspace.ensure_directories()
+    bundle_root = workspace.models_root / "retail_pd_v1"
+    bundle_root.mkdir(parents=True)
+    _write_minimal_bundle(bundle_root)
+    bundle = discover_model_bundles(workspace)[0]
+    records = load_threshold_records(workspace.thresholds_root, bundle)
+
+    workbook_bytes = build_threshold_workbook_bytes(records)
+    loaded = threshold_records_from_workbook_bytes(workbook_bytes)
+
+    assert [record.test_id for record in loaded] == [record.test_id for record in records]
+    assert loaded[0].label == records[0].label
 
 
 def _make_test_root(prefix: str) -> Path:

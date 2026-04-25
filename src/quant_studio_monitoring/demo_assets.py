@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .config import WorkspaceConfig
+from .monitoring_bundle_contract import PREFERRED_BUNDLE_DIRECTORY_NAME
 
 DEMO_BUNDLE_ID = "om_demo_bundle_v1"
 DEMO_DATASET_NAME = "om_demo_monitoring.csv"
@@ -21,7 +22,7 @@ def create_demo_assets(
     overwrite: bool = False,
 ) -> dict[str, Path]:
     workspace.ensure_directories()
-    bundle_root = workspace.models_root / DEMO_BUNDLE_ID
+    bundle_root = workspace.models_root / DEMO_BUNDLE_ID / PREFERRED_BUNDLE_DIRECTORY_NAME
     dataset_path = workspace.incoming_data_root / DEMO_DATASET_NAME
 
     if overwrite and bundle_root.exists():
@@ -114,6 +115,8 @@ def _demo_run_config() -> dict[str, object]:
 
 def _demo_monitoring_metadata() -> dict[str, str]:
     return {
+        "bundle_type": "quant_studio_model_bundle_for_monitoring",
+        "bundle_version": "1.0",
         "model_name": "OM Demo Retail PD",
         "model_version": "2026.04.demo",
         "model_owner": "Model Risk",
@@ -130,6 +133,8 @@ def _demo_monitoring_metadata() -> dict[str, str]:
 def _demo_manifest(bundle_root: Path) -> dict[str, object]:
     return {
         "export_version": DEMO_EXPORT_VERSION,
+        "bundle_type": "quant_studio_model_bundle_for_monitoring",
+        "bundle_version": "1.0",
         "bundle_id": DEMO_BUNDLE_ID,
         "bundle_root": str(bundle_root),
         "artifacts": [

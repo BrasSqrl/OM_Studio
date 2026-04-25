@@ -55,3 +55,7 @@ exclude = [
   "runs",
   "pytest-cache-files-*",
 ]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]

@@ -2,22 +2,28 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from hashlib import sha256
 from io import BytesIO
-import json
 from pathlib import Path
-import re
 from typing import Any
 
 import pandas as pd
 
 from .config import ALLOWED_DATASET_SUFFIXES, WorkspaceConfig
+from .file_cache import read_csv_cached, read_dataset_columns_cached, sha256_file_cached
+from .monitoring_bundle_contract import (
+    LEGACY_BUNDLE_DIRECTORY_NAME,
+    PREFERRED_BUNDLE_DIRECTORY_NAME,
+    classify_monitoring_bundle_version,
+    resolve_monitoring_bundle_version,
+    validate_monitoring_bundle_contract,
+)
 
 GENERIC_MODEL_NAME = "Quant Studio Model"
 MODEL_ARTIFACT_SUFFIXES = {".joblib", ".pkl", ".pickle", ".onnx"}
-SUPPORTED_TARGET_MODES = {"binary", "continuous", "regression"}
 MONITORING_METADATA_FIELDS = (
     "model_name",
     "model_version",
@@ -117,6 +123,8 @@ class ModelBundle:
     column_specs: list[BundleColumnSpec]
     compatibility_checks: list[BundleReadinessCheck] = field(default_factory=list)
     export_version: str | None = None
+    monitoring_contract_version: str | None = None
+    monitoring_contract_version_status: str = "missing"
     review_metadata_gaps: list[str] = field(default_factory=list)
     metadata_source: str = "inferred"
     issues: list[str] = field(default_factory=list)
@@ -206,6 +214,7 @@ class DatasetContractSummary:
     warnings: list[str]
     column_checks: pd.DataFrame
     date_coverage: pd.DataFrame
+    guardrails: pd.DataFrame
 
     @property
     def summary_frame(self) -> pd.DataFrame:
@@ -258,13 +267,21 @@ def discover_model_bundles(workspace: WorkspaceConfig) -> list[ModelBundle]:
         root = config_path.parent
         if root in seen_roots or "code_snapshot" in root.parts:
             continue
+        if root.name not in _supported_monitoring_bundle_directory_names() and (
+            nested_root := _find_nested_monitoring_bundle_root(root)
+        ) is not None:
+            seen_roots.add(nested_root)
+            bundles.append(_build_model_bundle(nested_root, workspace.models_root))
+            continue
         seen_roots.add(root)
-        bundles.append(_build_model_bundle(root))
+        bundles.append(_build_model_bundle(root, workspace.models_root))
 
     for artifact_path in workspace.models_root.rglob("*"):
         if not artifact_path.is_file() or artifact_path.suffix.lower() not in MODEL_ARTIFACT_SUFFIXES:
             continue
         if "code_snapshot" in artifact_path.parts:
+            continue
+        if _find_nested_monitoring_bundle_root(artifact_path.parent) is not None:
             continue
         if artifact_path.parent in seen_roots:
             continue
@@ -313,10 +330,8 @@ def read_dataset(path: Path) -> pd.DataFrame:
 
 def read_dataset_columns(path: Path) -> list[str]:
     suffix = path.suffix.lower()
-    if suffix == ".csv":
-        return pd.read_csv(path, nrows=0).columns.astype(str).tolist()
-    if suffix in {".xlsx", ".xls"}:
-        return pd.read_excel(path, nrows=0).columns.astype(str).tolist()
+    if suffix in ALLOWED_DATASET_SUFFIXES:
+        return read_dataset_columns_cached(path)
     return []
 
 
@@ -357,13 +372,19 @@ def summarize_dataset_contract(
     dataframe: pd.DataFrame,
     *,
     segment_column: str | None = None,
+    performance=None,
 ) -> DatasetContractSummary:
     contract = validate_input_contract(bundle, dataframe, segment_column=segment_column)
     hard_failures: list[str] = []
     warnings: list[str] = []
+    guardrails = _build_dataset_guardrails_frame(dataframe, performance=performance)
 
     if dataframe.empty:
         hard_failures.append("The monitoring dataset contains zero rows.")
+    guardrail_failures = guardrails.loc[guardrails["status"] == "fail", "detail"].astype(str)
+    guardrail_warnings = guardrails.loc[guardrails["status"] == "warning", "detail"].astype(str)
+    hard_failures.extend(guardrail_failures.tolist())
+    warnings.extend(guardrail_warnings.tolist())
     if contract.missing_required_columns:
         hard_failures.append(
             "Missing required columns: " + ", ".join(contract.missing_required_columns)
@@ -405,6 +426,7 @@ def summarize_dataset_contract(
         warnings=warnings,
         column_checks=column_checks,
         date_coverage=date_coverage,
+        guardrails=guardrails,
     )
 
 
@@ -494,10 +516,11 @@ def build_bundle_fingerprint_frame(bundle: ModelBundle) -> pd.DataFrame:
 
 def build_bundle_compatibility_frame(bundle: ModelBundle) -> pd.DataFrame:
     if not bundle.compatibility_checks:
-        return pd.DataFrame(columns=["severity", "item", "detail"])
+        return pd.DataFrame(columns=["code", "severity", "item", "detail"])
     return pd.DataFrame(
         [
             {
+                "code": check.code,
                 "severity": check.severity,
                 "item": check.item,
                 "detail": check.detail,
@@ -505,6 +528,100 @@ def build_bundle_compatibility_frame(bundle: ModelBundle) -> pd.DataFrame:
             for check in bundle.compatibility_checks
         ]
     )
+
+
+def build_model_bundle_intake_checklist_frame(bundle: ModelBundle) -> pd.DataFrame:
+    """Build a reviewer-facing checklist for bundle intake readiness."""
+
+    rows = [
+        _checklist_row(
+            area="Required Files",
+            item="quant_model.joblib",
+            status="pass" if bundle.bundle_paths.model_path.exists() else "fail",
+            detail="Saved model artifact used by the generated runner.",
+        ),
+        _checklist_row(
+            area="Required Files",
+            item="run_config.json",
+            status="pass" if bundle.bundle_paths.run_config_path.exists() else "fail",
+            detail="Saved run configuration used to reconstruct the raw-data contract.",
+        ),
+        _checklist_row(
+            area="Required Files",
+            item="generated_run.py",
+            status="pass" if bundle.bundle_paths.generated_runner_path else "fail",
+            detail="Generated raw-data scoring entry point.",
+        ),
+        _checklist_row(
+            area="Recommended Files",
+            item="monitoring_metadata.json",
+            status="pass" if bundle.bundle_paths.monitoring_metadata_path else "warning",
+            detail="Reviewer-facing metadata manifest.",
+        ),
+        _checklist_row(
+            area="Recommended Files",
+            item="artifact_manifest.json",
+            status="pass" if bundle.bundle_paths.manifest_path else "warning",
+            detail="Exported artifact inventory from the sister project.",
+        ),
+        _checklist_row(
+            area="Recommended Files",
+            item="input_snapshot.csv",
+            status="pass" if bundle.bundle_paths.reference_input_path else "warning",
+            detail="Reference raw input baseline for drift and data-quality diagnostics.",
+        ),
+        _checklist_row(
+            area="Recommended Files",
+            item="predictions.csv",
+            status="pass" if bundle.bundle_paths.reference_predictions_path else "warning",
+            detail="Reference score output baseline for score-drift diagnostics.",
+        ),
+        _checklist_row(
+            area="Optional Files",
+            item="code_snapshot",
+            status="pass" if bundle.bundle_paths.code_snapshot_path else "warning",
+            detail="Portable scoring support files copied from the sister project.",
+        ),
+        _checklist_row(
+            area="Contract",
+            item="monitoring_contract_version",
+            status=_version_checklist_status(bundle.monitoring_contract_version_status),
+            detail=(
+                "Declared version: "
+                f"{bundle.monitoring_contract_version or 'not declared'} "
+                f"({bundle.monitoring_contract_version_status})."
+            ),
+        ),
+        _checklist_row(
+            area="Contract",
+            item="target_mode",
+            status="pass" if bundle.target_mode in {"binary", "continuous", "regression"} else "fail",
+            detail=f"Detected target mode: {bundle.target_mode or 'unknown'}.",
+        ),
+        _checklist_row(
+            area="Contract",
+            item="raw_input_columns",
+            status="pass" if bundle.expected_input_columns else "warning",
+            detail=f"{len(bundle.expected_input_columns)} required raw input column(s) detected.",
+        ),
+        _checklist_row(
+            area="Reference",
+            item="reference_score_column",
+            status="pass" if bundle.reference_score_column else "warning",
+            detail=f"Detected reference score column: {bundle.reference_score_column or 'not detected'}.",
+        ),
+        _checklist_row(
+            area="Metadata",
+            item="review_completeness",
+            status="pass" if bundle.is_review_complete else "warning",
+            detail=(
+                "All required reviewer metadata is present."
+                if bundle.is_review_complete
+                else "Missing metadata: " + ", ".join(bundle.review_metadata_gaps)
+            ),
+        ),
+    ]
+    return pd.DataFrame(rows)
 
 
 def build_review_completeness_frame(bundle: ModelBundle) -> pd.DataFrame:
@@ -519,6 +636,97 @@ def build_review_completeness_frame(bundle: ModelBundle) -> pd.DataFrame:
                 "status": "missing" if label in gaps else "present",
             }
         )
+    return pd.DataFrame(rows)
+
+
+def build_reference_baseline_diagnostics_frame(bundle: ModelBundle) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    reference_raw = _read_csv_safely(bundle.bundle_paths.reference_input_path)
+    reference_predictions = _read_csv_safely(bundle.bundle_paths.reference_predictions_path)
+
+    rows.append(
+        {
+            "diagnostic": "reference_input_file",
+            "status": "present" if bundle.bundle_paths.reference_input_path else "missing",
+            "value": str(bundle.bundle_paths.reference_input_path or "n/a"),
+            "detail": "Reference raw inputs used for row-count, missingness, feature drift, and data-quality baselines.",
+        }
+    )
+    rows.append(
+        {
+            "diagnostic": "reference_predictions_file",
+            "status": "present" if bundle.bundle_paths.reference_predictions_path else "missing",
+            "value": str(bundle.bundle_paths.reference_predictions_path or "n/a"),
+            "detail": "Reference predictions used for score drift and score-profile diagnostics.",
+        }
+    )
+    rows.append(
+        {
+            "diagnostic": "reference_input_rows",
+            "status": "present" if reference_raw is not None else "missing",
+            "value": len(reference_raw) if reference_raw is not None else None,
+            "detail": "Rows available in input_snapshot.csv.",
+        }
+    )
+    rows.append(
+        {
+            "diagnostic": "reference_prediction_rows",
+            "status": "present" if reference_predictions is not None else "missing",
+            "value": len(reference_predictions) if reference_predictions is not None else None,
+            "detail": "Rows available in predictions.csv.",
+        }
+    )
+    rows.append(
+        {
+            "diagnostic": "reference_score_column",
+            "status": "present" if bundle.reference_score_column else "missing",
+            "value": bundle.reference_score_column or "n/a",
+            "detail": "Detected reference score column for score drift tests.",
+        }
+    )
+    label_available = False
+    if reference_predictions is not None:
+        label_available = any(
+            column and column in reference_predictions.columns
+            for column in (bundle.label_output_column, bundle.label_source_column)
+        )
+    if not label_available and reference_raw is not None and bundle.label_source_column:
+        label_available = bundle.label_source_column in reference_raw.columns
+    rows.append(
+        {
+            "diagnostic": "reference_label_available",
+            "status": "present" if label_available else "missing",
+            "value": bool(label_available),
+            "detail": "Reference labels are helpful for calibration and realized-performance context.",
+        }
+    )
+
+    if reference_raw is not None and bundle.date_columns:
+        for date_column in bundle.date_columns:
+            if date_column not in reference_raw.columns:
+                rows.append(
+                    {
+                        "diagnostic": f"reference_date_coverage:{date_column}",
+                        "status": "missing",
+                        "value": "n/a",
+                        "detail": "Configured date column is missing from input_snapshot.csv.",
+                    }
+                )
+                continue
+            parsed = pd.to_datetime(reference_raw[date_column], errors="coerce")
+            rows.append(
+                {
+                    "diagnostic": f"reference_date_coverage:{date_column}",
+                    "status": "present" if parsed.notna().any() else "missing",
+                    "value": (
+                        f"{parsed.min().date()} to {parsed.max().date()}"
+                        if parsed.notna().any()
+                        else "n/a"
+                    ),
+                    "detail": "Reference date coverage used to evaluate monitoring data freshness.",
+                }
+            )
+
     return pd.DataFrame(rows)
 
 
@@ -552,7 +760,31 @@ def slugify(value: str) -> str:
     return normalized or "item"
 
 
-def _build_model_bundle(root: Path) -> ModelBundle:
+def _supported_monitoring_bundle_directory_names() -> set[str]:
+    return {PREFERRED_BUNDLE_DIRECTORY_NAME, LEGACY_BUNDLE_DIRECTORY_NAME}
+
+
+def _find_nested_monitoring_bundle_root(root: Path) -> Path | None:
+    for directory_name in (
+        PREFERRED_BUNDLE_DIRECTORY_NAME,
+        LEGACY_BUNDLE_DIRECTORY_NAME,
+    ):
+        candidate = root / directory_name
+        if (candidate / "run_config.json").exists():
+            return candidate
+    return None
+
+
+def _bundle_id_source(root: Path, models_root: Path | None) -> str:
+    if models_root is None:
+        return root.name
+    try:
+        return root.relative_to(models_root).as_posix()
+    except ValueError:
+        return root.name
+
+
+def _build_model_bundle(root: Path, models_root: Path | None = None) -> ModelBundle:
     model_path = root / "quant_model.joblib"
     run_config_path = root / "run_config.json"
     generated_runner_path = root / "generated_run.py"
@@ -770,15 +1002,27 @@ def _build_model_bundle(root: Path) -> ModelBundle:
     compatibility_checks = _build_bundle_compatibility_checks(
         bundle_root=root,
         paths=paths,
+        manifest_payload=manifest_payload,
+        metadata_payload=metadata_payload,
+        config_payload=config_payload,
         target_mode=str(target_config.get("mode", "")),
         export_version=export_version,
         reference_score_column=reference_score_column,
         column_specs=column_specs,
     )
+    monitoring_contract_version = resolve_monitoring_bundle_version(
+        manifest_payload=manifest_payload,
+        metadata_payload=metadata_payload,
+        config_payload=config_payload,
+    )
+    monitoring_contract_version_status = classify_monitoring_bundle_version(
+        monitoring_contract_version
+    )
     review_metadata_gaps = _build_review_metadata_gaps(monitoring_metadata)
+    bundle_id = slugify(_bundle_id_source(root, models_root))
 
     return ModelBundle(
-        bundle_id=slugify(root.name),
+        bundle_id=bundle_id,
         display_name=monitoring_metadata.model_name,
         model_version=monitoring_metadata.model_version or root.name,
         model_owner=monitoring_metadata.model_owner,
@@ -806,6 +1050,8 @@ def _build_model_bundle(root: Path) -> ModelBundle:
         column_specs=column_specs,
         compatibility_checks=compatibility_checks,
         export_version=export_version,
+        monitoring_contract_version=monitoring_contract_version,
+        monitoring_contract_version_status=monitoring_contract_version_status,
         review_metadata_gaps=review_metadata_gaps,
         metadata_source=metadata_source,
         issues=issues,
@@ -920,6 +1166,8 @@ def _build_standalone_model_bundle(
         column_specs=[],
         compatibility_checks=compatibility_checks,
         export_version=None,
+        monitoring_contract_version=None,
+        monitoring_contract_version_status="missing",
         review_metadata_gaps=review_metadata_gaps,
         issues=issues,
         warnings=[],
@@ -1005,12 +1253,34 @@ def _build_bundle_compatibility_checks(
     *,
     bundle_root: Path,
     paths: BundlePaths,
+    manifest_payload: dict[str, Any],
+    metadata_payload: dict[str, Any],
+    config_payload: dict[str, Any],
     target_mode: str,
     export_version: str | None,
     reference_score_column: str | None,
     column_specs: list[BundleColumnSpec],
 ) -> list[BundleReadinessCheck]:
     checks: list[BundleReadinessCheck] = []
+    contract = validate_monitoring_bundle_contract(
+        root=bundle_root,
+        manifest_payload=manifest_payload,
+        metadata_payload=metadata_payload,
+        config_payload=config_payload,
+        target_mode=target_mode,
+        reference_score_column=reference_score_column,
+        column_count=len(column_specs),
+    )
+    checks.extend(
+        BundleReadinessCheck(
+            code=finding.code,
+            item=finding.item,
+            severity=finding.severity,
+            detail=finding.detail,
+        )
+        for finding in contract.findings
+    )
+
     if export_version:
         checks.append(
             BundleReadinessCheck(
@@ -1027,19 +1297,6 @@ def _build_bundle_compatibility_checks(
                 item="export_version",
                 severity="warning",
                 detail="No export version could be determined from artifact_manifest.json or run_config.json.",
-            )
-        )
-
-    normalized_target_mode = str(target_mode or "").strip().lower()
-    if normalized_target_mode and normalized_target_mode not in SUPPORTED_TARGET_MODES:
-        checks.append(
-            BundleReadinessCheck(
-                code="unsupported_target_mode",
-                item="target.mode",
-                severity="error",
-                detail=(
-                    f"Target mode '{target_mode}' is not supported for OM Studio monitoring reruns."
-                ),
             )
         )
 
@@ -1070,15 +1327,6 @@ def _build_bundle_compatibility_checks(
                 detail="Reference score diagnostics and deltas will be limited because predictions.csv is missing.",
             )
         )
-    elif reference_score_column is None:
-        checks.append(
-            BundleReadinessCheck(
-                code="compat_missing_reference_score_column",
-                item="predictions.csv",
-                severity="warning",
-                detail="A supported reference score column was not detected in predictions.csv.",
-            )
-        )
     if paths.generated_runner_path is None:
         checks.append(
             BundleReadinessCheck(
@@ -1097,15 +1345,6 @@ def _build_bundle_compatibility_checks(
                 detail="Portable reruns may depend on the local sister-project install because code_snapshot is missing.",
             )
         )
-    if not column_specs:
-        checks.append(
-            BundleReadinessCheck(
-                code="compat_missing_column_specs",
-                item="schema.column_specs",
-                severity="warning",
-                detail="No enabled schema columns were found. Validation and demo compatibility checks are limited.",
-            )
-        )
     if not bundle_root.exists():
         checks.append(
             BundleReadinessCheck(
@@ -1116,6 +1355,73 @@ def _build_bundle_compatibility_checks(
             )
         )
     return checks
+
+
+def _build_dataset_guardrails_frame(dataframe: pd.DataFrame, *, performance=None) -> pd.DataFrame:
+    warning_rows = getattr(performance, "large_dataset_warning_rows", 100_000)
+    block_rows = getattr(performance, "large_dataset_block_rows", 1_000_000)
+    warning_columns = getattr(performance, "large_dataset_warning_columns", 250)
+    block_columns = getattr(performance, "large_dataset_block_columns", 1_000)
+    rows = [
+        _guardrail_row(
+            metric="row_count",
+            observed_value=len(dataframe),
+            warning_threshold=warning_rows,
+            block_threshold=block_rows,
+            detail="Monitoring dataset row count.",
+        ),
+        _guardrail_row(
+            metric="column_count",
+            observed_value=len(dataframe.columns),
+            warning_threshold=warning_columns,
+            block_threshold=block_columns,
+            detail="Monitoring dataset column count.",
+        ),
+    ]
+    return pd.DataFrame(rows)
+
+
+def _guardrail_row(
+    *,
+    metric: str,
+    observed_value: int,
+    warning_threshold: int,
+    block_threshold: int,
+    detail: str,
+) -> dict[str, Any]:
+    status = "pass"
+    if observed_value >= block_threshold:
+        status = "fail"
+    elif observed_value >= warning_threshold:
+        status = "warning"
+    return {
+        "metric": metric,
+        "observed_value": observed_value,
+        "warning_threshold": warning_threshold,
+        "block_threshold": block_threshold,
+        "status": status,
+        "detail": (
+            f"{detail} Observed {observed_value:,}; warning starts at "
+            f"{warning_threshold:,}; hard stop starts at {block_threshold:,}."
+        ),
+    }
+
+
+def _checklist_row(*, area: str, item: str, status: str, detail: str) -> dict[str, str]:
+    return {
+        "area": area,
+        "item": item,
+        "status": status,
+        "detail": detail,
+    }
+
+
+def _version_checklist_status(status: str) -> str:
+    if status == "supported":
+        return "pass"
+    if status in {"missing", "deprecated", "future"}:
+        return "warning"
+    return "fail"
 
 
 def _resolve_export_version(
@@ -1365,14 +1671,7 @@ def _directory_row(label: str, path: Path) -> dict[str, Any]:
 
 
 def _sha256_file(path: Path) -> str:
-    digest = sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_file_cached(path)
 
 
 def _append_check(
@@ -1409,6 +1708,15 @@ def _read_json_safely(path: Path) -> tuple[dict[str, Any], str | None]:
             return json.load(handle), None
     except (OSError, json.JSONDecodeError) as exc:
         return {}, str(exc)
+
+
+def _read_csv_safely(path: Path | None) -> pd.DataFrame | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        return read_csv_cached(path)
+    except (OSError, ValueError, pd.errors.ParserError):
+        return None
 
 
 def _safe_float(value: Any) -> float | None:

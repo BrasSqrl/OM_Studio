@@ -14,7 +14,7 @@ The implemented scope is intentionally narrow:
 - rerun approved bundles on raw monitoring data
 - compute per-test pass/fail outcomes
 - export HTML and Excel monitoring artifacts under `runs/`
-- show current-session run results in the UI
+- show current-session run results and a lightweight persisted run index in the UI
 
 Out of scope:
 - model training
@@ -23,11 +23,12 @@ Out of scope:
 - scheduling
 - external databases
 - authentication
-- persistent run-history registry beyond the current session
+- model approval workflow management
 
 ## Compliant Bundle Contract
 
-For MVP, a supported model must be a compliant rerunnable bundle.
+For MVP, a supported model must be a compliant rerunnable bundle. The preferred
+sister-project handoff shape is a `model_bundle_for_monitoring/` directory.
 
 Minimum required files in a bundle directory:
 - `quant_model.joblib`
@@ -38,9 +39,10 @@ Reference files used for richer monitoring diagnostics:
 - `input_snapshot.csv`
 - `predictions.csv`
 - `artifact_manifest.json`
+- `monitoring_metadata.json`
 
 Optional metadata override:
-- `monitoring_metadata.json`
+- OM Studio can save app-managed review metadata back to `monitoring_metadata.json`.
 
 ## Workflow
 
@@ -107,12 +109,17 @@ Available for continuous labeled monitoring data:
 
 - `app/streamlit_app.py`: Streamlit monitoring UI
 - `src/quant_studio_monitoring/config.py`: workspace directory configuration
+- `src/quant_studio_monitoring/streamlit_ui/app_controller.py`: package-owned Streamlit controller
+- `src/quant_studio_monitoring/monitoring_bundle_contract.py`: formal bundle intake contract
+- `src/quant_studio_monitoring/monitoring_run_config.py`: saved per-run monitoring configuration
 - `src/quant_studio_monitoring/registry.py`: bundle and dataset discovery
 - `src/quant_studio_monitoring/thresholds.py`: per-model threshold persistence
 - `src/quant_studio_monitoring/monitoring_pipeline.py`: scoring orchestration and monitoring tests
 - `src/quant_studio_monitoring/monitoring_reporting.py`: HTML/Excel artifact generation
 - `src/quant_studio_monitoring/presentation.py`: shared UI/theme helpers
 - `docs/ROADMAP.md`: strict MVP roadmap
+- `docs/SISTER_REPO_ALIGNMENT_ROADMAP.md`: implemented sister-project alignment roadmap
+- `docs/GUI_TO_CODE_TRACEABILITY_GUIDE.md`: UI-to-code/artifact traceability map
 
 ## Launch
 
